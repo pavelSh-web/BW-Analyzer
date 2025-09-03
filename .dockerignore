@@ -1,0 +1,38 @@
+# Python
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info
+.venv
+venv
+.env
+
+# Git & IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Byte-compiled / caches
+*.cache
+*.mypy_cache
+
+# Local data
+storage
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# Build artifacts
+build
+.dist
+.eggs
+wheelhouse
+
+# OS
+.DS_Store
+Thumbs.db
