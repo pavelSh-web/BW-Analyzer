@@ -1,38 +1,62 @@
-# Python
-__pycache__
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info
-.venv
-venv
-.env
-
-# Git & IDE
+# Git
 .git
 .gitignore
-.idea
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# Documentation
+*.md
+!README.md
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
 .vscode
+.idea
+*.swp
+*.swo
+*~
 
-# Byte-compiled / caches
-*.cache
-*.mypy_cache
-
-# Local data
-storage
-*.wav
+# Project specific
+storage/
 *.mp3
+*.wav
 *.flac
 *.ogg
 *.m4a
 
-# Build artifacts
-build
-.dist
-.eggs
-wheelhouse
+# Scripts (не нужны в контейнере)
+start.sh
+stop.sh  
+test-api.sh
 
-# OS
-.DS_Store
-Thumbs.db
+# Docker
+docker-compose.yml
+Dockerfile

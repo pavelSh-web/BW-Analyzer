@@ -5,12 +5,21 @@ import numpy as np
 import librosa
 import soundfile as sf
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+# Imports for task queue
+try:
+    from .celery_app import celery_app
+    QUEUE_AVAILABLE = True
+except ImportError:
+    QUEUE_AVAILABLE = False
+    print("Warning: Celery/Redis not available. Queue functionality disabled.")
 
 
 # ---------------------------
-# PANNs (только для тегов)
+# PANNs (for tags only)
 # ---------------------------
 try:
     from panns_inference import AudioTagging, labels as PANN_LABELS
@@ -23,7 +32,7 @@ except Exception:
 
 _PANN_MODEL: Optional["AudioTagging"] = None
 
-# Список 125 самых важных музыкальных тегов для анализа
+# List of 125 most important musical tags for analysis
 IMPORTANT_TAG_GROUPS = {
     "music": [
         "Pop music", "Rock music", "Hip hop music", "Jazz", "Blues", "Country music", 
@@ -45,23 +54,23 @@ IMPORTANT_TAG_GROUPS = {
         "Dance music", "Independent music", "Traditional music",
     ],
     "instruments": [
-        # Основные инструменты
+        # Main instruments
         "Guitar", "Electric guitar", "Acoustic guitar", "Bass guitar", "Piano", "Electric piano",
         "Drum", "Drum kit", "Snare drum", "Bass drum", "Hi-hat", "Cymbal",
         
-        # Клавишные и синтезаторы
+        # Keyboards and synthesizers
         "Synthesizer", "Keyboard (musical)", "Organ", "Electronic organ", "Harpsichord",
         
-        # Струнные
+        # String instruments
         "Violin", "Cello",
         
-        # Духовые
+        # Wind instruments
         "Saxophone", "Flute",
         
-        # Ударные и перкуссия
+        # Percussion
         "Percussion", "Bell",
         
-        # Этнические и экзотические
+        # Ethnic and exotic instruments
         "Sitar", "Tabla", "Didgeridoo", "Bagpipes", "Accordion"
     ],
     "vocal": [
@@ -86,7 +95,7 @@ def _pann_model() -> Optional["AudioTagging"]:
     return _PANN_MODEL
 
 def get_audio_tags(audio_path: str, topk_per_group: int = 5) -> Optional[Dict[str, List[Dict[str, Any]]]]:
-    """Получить топ-N тегов от PANNs по каждой группе отдельно"""
+    """Get top-N tags from PANNs for each group separately"""
     model = _pann_model()
     if model is None:
         return None
@@ -102,9 +111,9 @@ def get_audio_tags(audio_path: str, topk_per_group: int = 5) -> Optional[Dict[st
             
             result_groups = {}
             
-            # Анализируем каждую группу отдельно
+            # Analyze each group separately
             for group_name, group_tags in IMPORTANT_TAG_GROUPS.items():
-                # Находим индексы тегов этой группы
+                # Find indices of tags in this group
                 group_indices = []
                 group_labels = []
                 
@@ -117,13 +126,13 @@ def get_audio_tags(audio_path: str, topk_per_group: int = 5) -> Optional[Dict[st
                     result_groups[group_name] = []
                     continue
                 
-                # Получаем вероятности только для тегов этой группы
+                # Get probabilities only for tags in this group
                 group_probs = probs[group_indices]
                 
-                # Сортируем по убыванию вероятности
+                # Sort by descending probability
                 sorted_indices = np.argsort(-group_probs)
                 
-                # Берем топ-N для этой группы
+                # Take top-N for this group
                 top_indices = sorted_indices[:topk_per_group]
                 
                 result_groups[group_name] = [
@@ -143,41 +152,41 @@ def get_audio_tags(audio_path: str, topk_per_group: int = 5) -> Optional[Dict[st
 
 
 # ---------------------------
-# Музыкальные характеристики
+# Musical characteristics
 # ---------------------------
 def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
-    """Анализ музыкальных характеристик трека с улучшенными алгоритмами"""
+    """Analyze musical characteristics of a track with improved algorithms"""
     features = {}
     
     try:
-        # === ТЕМП (улучшенный алгоритм) ===
-        # Используем несколько методов и выбираем лучший
+        # === TEMPO (improved algorithm) ===
+        # Use multiple methods and choose the best one
         tempo_methods = []
         
-        # Метод 1: librosa.beat.tempo (по умолчанию)
+        # Method 1: librosa.beat.tempo (default)
         tempo1, _ = librosa.beat.beat_track(y=y, sr=sr, units='time')
         tempo_methods.append(('librosa_default', tempo1))
         
-        # Метод 2: с другими параметрами
+        # Method 2: with different parameters
         tempo2, _ = librosa.beat.beat_track(y=y, sr=sr, units='time', 
                                            start_bpm=60)
         tempo_methods.append(('librosa_wide', tempo2))
         
-        # Метод 3: через onset detection
+        # Method 3: through onset detection
         onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='time')
         if len(onset_frames) > 1:
             intervals = np.diff(onset_frames)
-            # Убираем выбросы (интервалы больше 2 секунд)
+            # Remove outliers (intervals longer than 2 seconds)
             intervals = intervals[intervals < 2.0]
             if len(intervals) > 0:
                 avg_interval = np.median(intervals)
                 tempo3 = 60.0 / avg_interval
                 tempo_methods.append(('onset_based', tempo3))
         
-        # Выбираем темп ближе к разумному диапазону (60-200 BPM)
+        # Choose tempo closer to reasonable range (60-200 BPM)
         valid_tempos = [(name, t) for name, t in tempo_methods if 60 <= t <= 200]
         if valid_tempos:
-            # Предпочитаем темпы в диапазоне 80-160 BPM
+            # Prefer tempos in range 80-160 BPM
             preferred_tempos = [(name, t) for name, t in valid_tempos if 80 <= t <= 160]
             if preferred_tempos:
                 tempo_method, tempo_bpm = preferred_tempos[0]
@@ -189,22 +198,22 @@ def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
         features["tempo_bpm"] = round(tempo_bpm, 1)
         features["tempo_method"] = tempo_method
         
-        # === ТОНАЛЬНОСТЬ (улучшенный алгоритм) ===
-        # Используем несколько методов
+        # === KEY (improved algorithm) ===
+        # Use multiple methods
         key_methods = []
         
-        # Метод 1: librosa.key (по умолчанию)
+        # Method 1: librosa.key (default)
         try:
             key1 = librosa.key.estimate_key(y, sr)
             key_methods.append(('librosa_default', key1))
         except:
             pass
         
-        # Метод 2: через chroma с разными параметрами
+        # Method 2: through chroma with different parameters
         try:
             chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
             chroma_mean = np.mean(chroma, axis=1)
-            # Находим доминирующую ноту
+            # Find dominant note
             dominant_note = np.argmax(chroma_mean)
             note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
             key2 = note_names[dominant_note]
@@ -212,7 +221,7 @@ def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
         except:
             pass
         
-        # Метод 3: через chroma с весами для мажор/минор (улучшенный)
+        # Method 3: through chroma with weights for major/minor (improved)
         try:
             chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
             chroma_mean = np.mean(chroma, axis=1)
@@ -637,7 +646,20 @@ def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
 # ---------------------------
 # FastAPI
 # ---------------------------
-app = FastAPI(title="Audio Tags & Features API", version="1.0.0")
+app = FastAPI(
+    title="Audio Analysis API", 
+    version="2.0.0",
+    description="Audio analysis microservice with queue support"
+)
+
+# Add CORS for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production specify specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/analyze")
@@ -646,11 +668,11 @@ async def analyze_track(
     top_tags_per_group: int = 5
 ):
     """
-    Анализирует аудиофайл и возвращает:
-    - PANNs теги по группам (музыкальные жанры, инструменты, вокал)
-    - Музыкальные характеристики (темп, тональность, размер, etc.)
+    Analyzes audio file and returns:
+    - PANNs tags by groups (musical genres, instruments, vocals)
+    - Musical characteristics (tempo, key, time signature, etc.)
     
-    После анализа все временные файлы удаляются.
+    All temporary files are deleted after analysis.
     """
     if not file.filename.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
         raise HTTPException(400, "Unsupported file type")
@@ -659,7 +681,7 @@ async def analyze_track(
     temp_path = None
     
     try:
-        # Сохраняем во временный файл
+        # Save to temporary file
         with tempfile.NamedTemporaryFile(
             suffix=os.path.splitext(file.filename)[1] or ".wav", 
             delete=False
@@ -668,16 +690,16 @@ async def analyze_track(
             tmp.write(content)
             temp_path = tmp.name
         
-        # Загружаем аудио
+        # Load audio
         y, sr = librosa.load(temp_path, sr=None, mono=True)
         
-        # Получаем теги от PANNs по группам
+        # Get PANNs tags by groups
         tags = get_audio_tags(temp_path, topk_per_group=top_tags_per_group)
         
-        # Анализируем музыкальные характеристики
+        # Analyze musical characteristics
         features = analyze_audio_features(y, sr)
         
-        # Длительность трека
+        # Track duration
         duration = float(len(y) / sr)
         
         result = {
@@ -694,7 +716,7 @@ async def analyze_track(
         raise HTTPException(500, f"Analysis failed: {str(e)}")
         
     finally:
-        # ОБЯЗАТЕЛЬНО удаляем временный файл
+        # MUST delete temporary file
         if temp_path and os.path.exists(temp_path):
             try:
                 os.unlink(temp_path)
@@ -727,3 +749,123 @@ def get_important_tag_groups():
         "categories": {key: len(tags) for key, tags in IMPORTANT_TAG_GROUPS.items()},
         "tags": IMPORTANT_TAG_GROUPS
     }
+
+
+# ---------------------------
+# Queue endpoints
+# ---------------------------
+
+@app.post("/analyze/async")
+async def analyze_track_async(
+    file: UploadFile = File(...),
+    top_tags_per_group: int = 5
+):
+    """
+    Start asynchronous audio file analysis through queue
+    
+    Returns task_id for progress tracking
+    """
+    if not QUEUE_AVAILABLE:
+        raise HTTPException(503, "Queue system not available")
+        
+    if not file.filename.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
+        raise HTTPException(400, "Unsupported file type")
+    
+    try:
+        # Import tasks here to avoid circular import
+        from .tasks import analyze_audio_file
+        
+        # Read file
+        file_data = await file.read()
+        
+        # Start task in queue
+        task = analyze_audio_file.delay(file_data, file.filename, top_tags_per_group)
+        
+        return {
+            "task_id": task.id,
+            "filename": file.filename,
+            "status": "queued",
+            "message": "Task queued for processing"
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Failed to queue task: {str(e)}")
+
+
+@app.get("/analyze/status/{task_id}")
+def get_task_status(task_id: str):
+    """
+    Get analysis task status
+    
+    Args:
+        task_id: Task ID from /analyze/async
+        
+    Returns:
+        Status and result (if ready)
+    """
+    if not QUEUE_AVAILABLE:
+        raise HTTPException(503, "Queue system not available")
+    
+    try:
+        result = celery_app.AsyncResult(task_id)
+        
+        if result.state == 'PENDING':
+            return {
+                'task_id': task_id,
+                'status': 'pending', 
+                'message': 'Task is waiting to be processed'
+            }
+        elif result.state == 'PROCESSING':
+            return {
+                'task_id': task_id,
+                'status': 'processing',
+                'stage': result.info.get('stage', 'unknown'),
+                'message': f"Task is being processed: {result.info.get('stage', 'unknown')}"
+            }
+        elif result.state == 'SUCCESS':
+            return {
+                'task_id': task_id,
+                'status': 'completed', 
+                'result': result.result
+            }
+        elif result.state == 'FAILURE':
+            return {
+                'task_id': task_id,
+                'status': 'failed',
+                'error': str(result.info),
+                'message': 'Task failed to complete'
+            }
+        else:
+            return {
+                'task_id': task_id,
+                'status': result.state, 
+                'message': f'Task state: {result.state}'
+            }
+            
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get task status: {str(e)}")
+
+
+@app.get("/queue/info")
+def get_queue_info():
+    """Queue status information"""
+    if not QUEUE_AVAILABLE:
+        return {"queue_available": False, "message": "Queue system not available"}
+    
+    try:
+        # Get Celery information
+        stats = celery_app.control.inspect().stats()
+        active = celery_app.control.inspect().active()
+        
+        return {
+            "queue_available": True,
+            "workers": stats,
+            "active_tasks": active,
+            "message": "Queue system is operational"
+        }
+    except Exception as e:
+        return {
+            "queue_available": False,
+            "error": str(e),
+            "message": "Queue system error"
+        }
