@@ -1,26 +1,20 @@
-import os, tempfile, time
+import os
+import re
+import time
+import tempfile
 from typing import List, Optional, Dict, Any
 
 import numpy as np
 import librosa
-import soundfile as sf
+import soundfile as sf  # noqa: F401
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Imports for task queue
-try:
-    from .celery_app import celery_app
-    QUEUE_AVAILABLE = True
-except ImportError:
-    QUEUE_AVAILABLE = False
-    print("Warning: Celery/Redis not available. Queue functionality disabled.")
-
-
-# ---------------------------
-# PANNs (for tags only)
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# PANNs (AudioSet)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from panns_inference import AudioTagging, labels as PANN_LABELS
     import torch
@@ -32,59 +26,344 @@ except Exception:
 
 _PANN_MODEL: Optional["AudioTagging"] = None
 
-# List of 125 most important musical tags for analysis
-IMPORTANT_TAG_GROUPS = {
-    "music": [
-        "Pop music", "Rock music", "Hip hop music", "Jazz", "Blues", "Country music", 
-        "Electronic music", "Classical music", "Folk music", "Reggae", "R&B", "Soul music",
-        "Gospel music", "Christian music", "Ambient music", "Techno", "House music", "Trance music",
-        "Heavy metal", "Punk rock", "Alternative rock", "Indie rock", "Funk", "Disco", "Ska",
-        "New-age music", "World music", "Latin music", "Bossa nova", "Salsa music", "Flamenco",
-        "Opera", "Musical theatre", "Baroque music", "Romantic music", "Impressionist music",
-        "Minimalist music", "Experimental music", "Avant-garde music", "Progressive rock",
-        "Psychedelic rock", "Grunge", "Emo", "Hardcore punk", "Death metal", "Black metal",
-        "Thrash metal", "Power metal", "Symphonic metal", "Industrial music", "Dubstep",
-        "Drum and bass", "Breakbeat", "Garage music", "UK garage", "2-step garage",
-        "Trap music", "Future bass", "Chillout", "Downtempo", "Trip hop", "IDM", "Glitch",
-        "Synthwave", "Vaporwave", "Lo-fi", "Drill music", "Afrobeat", "Highlife", "Kwaito",
-        "Bhangra", "Bollywood music", "K-pop", "J-pop", "Anime music", "Video game music",
-        "Film score", "Soundtrack", "Instrumental", "Acoustic music", "Unplugged",
-        "Rhythm and blues", "Swing music", "Carnatic music", "Middle Eastern music", 
-        "Music of Africa", "Music of Asia", "Music of Bollywood", "Music of Latin America",
-        "Dance music", "Independent music", "Traditional music",
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) Human seed groups (will be canonized to true PANN labels)
+#    These lists should contain real AudioSet labels whenever possible.
+#    Any label not found in PANN_LABELS will be dropped during canonization.
+# ──────────────────────────────────────────────────────────────────────────────
+IMPORTANT_TAG_GROUPS_RAW: Dict[str, List[str]] = {
+    "genre": [
+        "Pop music", "Rock music", "Hip hop music", "Jazz", "Blues",
+        "Country", "Electronic music", "Classical music", "Folk music", "Reggae",
+        "Rhythm and blues", "Soul music", "Gospel music", "Christian music",
+        "Ambient music", "Techno", "House music", "Trance music", "Heavy metal",
+        "Punk rock", "Funk", "Disco", "Ska", "New-age music",
+        "Salsa music", "Flamenco", "Opera", "Progressive rock",
+        "Psychedelic rock", "Grunge", "Dubstep", "Drum and bass",
+        "Afrobeat", "Video game music", "Swing music", "Carnatic music",
+        "Middle Eastern music", "Music of Africa", "Music of Asia",
+        "Music of Bollywood", "Music of Latin America", "Dance music",
+        "Traditional music"
     ],
     "instruments": [
-        # Main instruments
-        "Guitar", "Electric guitar", "Acoustic guitar", "Bass guitar", "Piano", "Electric piano",
-        "Drum", "Drum kit", "Snare drum", "Bass drum", "Hi-hat", "Cymbal",
-        
-        # Keyboards and synthesizers
-        "Synthesizer", "Keyboard (musical)", "Organ", "Electronic organ", "Harpsichord",
-        
-        # String instruments
-        "Violin", "Cello",
-        
-        # Wind instruments
-        "Saxophone", "Flute",
-        
-        # Percussion
-        "Percussion", "Bell",
-        
-        # Ethnic and exotic instruments
-        "Sitar", "Tabla", "Didgeridoo", "Bagpipes", "Accordion"
+        "Guitar", "Electric guitar", "Acoustic guitar", "Bass guitar",
+        "Piano", "Electric piano", "Drum", "Drum kit", "Drum machine",
+        "Snare drum", "Bass drum", "Hi-hat", "Cymbal", "Synthesizer",
+        "Keyboard (musical)", "Organ", "Electronic organ", "Harpsichord",
+        "Violin, fiddle", "Cello", "Saxophone", "Flute", "Percussion",
+        "Bell", "Sitar", "Tabla", "Didgeridoo", "Bagpipes", "Accordion"
     ],
     "vocal": [
-        "Singing", "Vocal", "Choir", "A cappella", "Rapping", "Scat singing", "Whistling",
-        "Beatboxing", "Backing vocals"
+        "Singing", "Choir", "A capella",
+        "Rapping", "Whistling", "Beatboxing",
+        "Background vocals"
+    ],
+    "atmosphere": [
+        "Drone", "Noise", "Buzz", "Hiss", "Hum", "Rumble",
+        "Whoosh, swoosh", "Reverberation", "Echo", "Silence",
+        "Environmental noise", "Crackle", "Click", "Sizzle",
+        "Applause", "Cheering", "Crowd", "Chatter"
+    ],
+    "spectral": [
+        "Distortion", "Audio clipping",
+        "Chorus effect", "Flanger"
+    ],
+    "style": [
+        "Jingle, tinkle",
+        "Theme music",
+        "Background music",
+        "Wedding music",
+        "Christmas music",
+        "Meditation music"
     ]
 }
 
-IMPORTANT_TAGS = (
-    IMPORTANT_TAG_GROUPS["music"] +
-    IMPORTANT_TAG_GROUPS["instruments"] +
-    IMPORTANT_TAG_GROUPS["vocal"]
-)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 2) Display aliases (UI only). Do not affect matching or group canonization.
+# ──────────────────────────────────────────────────────────────────────────────
+DISPLAY_ALIASES: Dict[str, str] = {
+    "Violin, fiddle": "Violin",
+    "Whoosh, swoosh": "Whoosh",
+    "Audio clipping": "Clipping",
+    "Background vocals": "Backing vocals",
+    "A capella": "A cappella",
+    "Rhythm and blues": "R&B",
+    "Keyboard (musical)": "Keyboard",
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) Rules engine (generic). We expand to targets (e.g., genre, style).
+#    All rule tag names must be true PANN labels.
+# ──────────────────────────────────────────────────────────────────────────────
+RULE_TARGETS = ("genre", "style")
+
+CUSTOM_RULES: List[Dict[str, Any]] = [
+    # Modern / alt genres
+    {
+        "label": "Lo-fi",
+        "target": "genre",
+        "include_any": ["Hip hop music", "Jazz", "Ambient music", "Drum machine", "Keyboard (musical)"],
+        "boost": ["Crackle", "Hiss", "Hum", "Click", "Chorus effect"],
+        "exclude": ["Heavy metal", "Dubstep", "Trance music"],
+        "tempo_bpm_range": [60, 95],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.7, "tempo": 0.6},
+        "threshold": 1.2
+    },
+    {
+        "label": "Trap",
+        "target": "genre",
+        "include_any": ["Hip hop music", "Drum machine"],
+        "boost": ["Hi-hat", "Snare drum", "Bass drum"],
+        "tempo_bpm_range": [130, 160],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.5, "tempo": 0.6},
+        "threshold": 1.1
+    },
+    {
+        "label": "Drill",
+        "target": "genre",
+        "include_any": ["Hip hop music"],
+        "boost": ["Hi-hat", "Snare drum"],
+        "tempo_bpm_range": [135, 150],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.4, "tempo": 0.6},
+        "threshold": 1.0
+    },
+    {
+        "label": "Synthwave",
+        "target": "genre",
+        "include_any": ["Electronic music", "House music", "Techno"],
+        "boost": ["Synthesizer", "Keyboard (musical)", "Chorus effect", "Flanger"],
+        "exclude": ["Dubstep", "Drum and bass"],
+        "tempo_bpm_range": [80, 120],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.6, "tempo": 0.4},
+        "threshold": 1.2
+    },
+    {
+        "label": "Vaporwave",
+        "target": "genre",
+        "include_any": ["Electronic music", "Ambient music"],
+        "boost": ["Chorus effect", "Reverberation", "Echo"],
+        "tempo_bpm_range": [60, 100],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.6, "tempo": 0.4},
+        "threshold": 1.0
+    },
+    {
+        "label": "Future bass",
+        "target": "genre",
+        "include_any": ["Electronic music"],
+        "boost": ["Synthesizer", "Keyboard (musical)"],
+        "exclude": ["Dubstep", "Drum and bass"],
+        "tempo_bpm_range": [135, 160],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.5, "tempo": 0.5},
+        "threshold": 1.1
+    },
+    {
+        "label": "Phonk",
+        "target": "genre",
+        "include_any": ["Hip hop music"],
+        "boost": ["Drum machine", "Distortion", "Reverberation", "Chorus effect", "Click"],
+        "tempo_bpm_range": [140, 165],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.6, "tempo": 0.5},
+        "threshold": 1.2
+    },
+    {
+        "label": "K-pop",
+        "target": "genre",
+        "include_any": ["Pop music"],
+        "boost": ["Electronic music", "Dance music", "Choir", "Background vocals"],
+        "exclude": ["Heavy metal"],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.5, "tempo": 0.0},
+        "threshold": 1.0
+    },
+    {
+        "label": "J-pop",
+        "target": "genre",
+        "include_any": ["Pop music"],
+        "boost": ["Electronic music", "Dance music", "Choir", "Background vocals"],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.5, "tempo": 0.0},
+        "threshold": 1.0
+    },
+
+    # Hip hop / jazz adjacent
+    {
+        "label": "Lo-fi hip hop",
+        "target": "genre",
+        "include_any": ["Hip hop music"],
+        "boost": ["Drum machine", "Keyboard (musical)", "Electric piano", "Piano",
+                  "Crackle", "Hiss", "Hum", "Click", "Chorus effect", "Reverberation", "Saxophone"],
+        "exclude": ["Dubstep", "Drum and bass", "Heavy metal"],
+        "tempo_bpm_range": [60, 95],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.7, "tempo": 0.6},
+        "threshold": 1.25
+    },
+    {
+        "label": "Jazz rap",
+        "target": "genre",
+        "include_all": ["Hip hop music", "Jazz"],
+        "boost": ["Piano", "Saxophone", "Electric piano", "Keyboard (musical)", "Drum kit"],
+        "tempo_bpm_range": [80, 110],
+        "weights": {"include_any": 1.0, "include_all": 1.2, "boost": 0.6, "tempo": 0.4},
+        "threshold": 1.3
+    },
+    {
+        "label": "Boom bap",
+        "target": "genre",
+        "include_any": ["Hip hop music"],
+        "boost": ["Drum kit", "Snare drum", "Bass drum"],
+        "exclude": ["Drum and bass", "Dubstep"],
+        "tempo_bpm_range": [85, 105],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.5, "tempo": 0.6},
+        "threshold": 1.1
+    },
+    {
+        "label": "Neo-soul",
+        "target": "genre",
+        "include_any": ["Rhythm and blues", "Soul music"],
+        "boost": ["Jazz", "Electric piano", "Keyboard (musical)", "Background vocals", "Reverberation"],
+        "exclude": ["Heavy metal"],
+        "tempo_bpm_range": [70, 110],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.6, "tempo": 0.3},
+        "threshold": 1.1
+    },
+    {
+        "label": "Acid jazz",
+        "target": "genre",
+        "include_all": ["Jazz", "Funk"],
+        "boost": ["Synthesizer", "Keyboard (musical)", "Chorus effect", "Flanger", "Reverberation"],
+        "tempo_bpm_range": [90, 120],
+        "weights": {"include_any": 1.0, "include_all": 1.1, "boost": 0.6, "tempo": 0.3},
+        "threshold": 1.2
+    },
+    {
+        "label": "Nu jazz",
+        "target": "genre",
+        "include_all": ["Jazz", "Electronic music"],
+        "boost": ["Synthesizer", "Keyboard (musical)", "Chorus effect", "Reverberation", "Piano", "Saxophone"],
+        "exclude": ["Dubstep", "Drum and bass"],
+        "tempo_bpm_range": [80, 125],
+        "weights": {"include_any": 1.0, "include_all": 1.1, "boost": 0.6, "tempo": 0.3},
+        "threshold": 1.2
+    },
+    {
+        "label": "Trip hop (modern)",
+        "target": "genre",
+        "include_all": ["Electronic music", "Hip hop music"],
+        "boost": ["Reverberation", "Echo", "Chorus effect", "Drone", "Hiss", "Hum"],
+        "exclude": ["Drum and bass", "Dubstep"],
+        "tempo_bpm_range": [65, 95],
+        "weights": {"include_any": 1.0, "include_all": 1.2, "boost": 0.7, "tempo": 0.5},
+        "threshold": 1.25
+    },
+    {
+        "label": "Jazzhop / Chillhop",
+        "target": "genre",
+        "include_all": ["Hip hop music", "Jazz"],
+        "boost": ["Electric piano", "Piano", "Saxophone", "Crackle", "Hiss", "Reverberation"],
+        "exclude": ["Drum and bass", "Dubstep"],
+        "tempo_bpm_range": [70, 100],
+        "weights": {"include_any": 1.0, "include_all": 1.2, "boost": 0.6, "tempo": 0.5},
+        "threshold": 1.25
+    },
+
+    # Styles (target: style)
+    {
+        "label": "Vinyl texture",
+        "target": "style",
+        "include_any": ["Crackle", "Hiss", "Hum", "Click"],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.0, "tempo": 0.0},
+        "threshold": 0.9
+    },
+    {
+        "label": "Live ambience",
+        "target": "style",
+        "include_any": ["Applause", "Cheering", "Crowd", "Chatter"],
+        "boost": ["Reverberation", "Echo", "Environmental noise"],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.4, "tempo": 0.0},
+        "threshold": 1.0
+    },
+    {
+        "label": "Cinematic",
+        "target": "style",
+        "include_any": ["Theme music", "Background music"],
+        "boost": ["Reverberation", "Echo"],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.4, "tempo": 0.0},
+        "threshold": 1.0
+    },
+    {
+        "label": "Meditative",
+        "target": "style",
+        "include_any": ["Meditation music", "Chant", "Mantra"],
+        "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.0, "tempo": 0.0},
+        "threshold": 1.0
+    },
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _norm(s: str) -> str:
+    s = (s or "").strip().casefold()
+    s = s.replace("&", "and")
+    s = re.sub(r"[\u2010-\u2015\-\_/]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _build_label_index() -> Dict[str, str]:
+    """normalized(PANN_LABEL) -> PANN_LABEL"""
+    idx: Dict[str, str] = {}
+    for lbl in PANN_LABELS:
+        idx[_norm(lbl)] = lbl
+    return idx
+
+
+INDEX_NORM_TO_TRUE: Dict[str, str] = _build_label_index() if _PANN_OK else {}
+
+
+def _canonize_groups(raw: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """
+    Keep only labels that exist in PANN_LABELS. Drop the rest.
+    No synonym mapping is applied here by design.
+    """
+    if not _PANN_OK:
+        # Model/labels not available at import time: return raw as-is.
+        return raw
+
+    groups: Dict[str, List[str]] = {}
+    for g, tags in raw.items():
+        out: List[str] = []
+        for t in tags:
+            n = _norm(t)
+            true_lbl = INDEX_NORM_TO_TRUE.get(n)
+            if true_lbl and true_lbl not in out:
+                out.append(true_lbl)
+            else:
+                if not true_lbl:
+                    print(f"[canonize] dropped not-in-PANN label: '{t}'")
+        groups[g] = out
+    return groups
+
+
+def prettify_label(label_raw: str, group_name: Optional[str] = None) -> str:
+    """UI-friendly display name; does not affect matching."""
+    if label_raw in DISPLAY_ALIASES:
+        return DISPLAY_ALIASES[label_raw]
+    if group_name == "genre" and label_raw.endswith(" music"):
+        return label_raw[:-6]
+    if "," in label_raw:
+        return label_raw.split(",", 1)[0].strip()
+    return label_raw
+
+
+IMPORTANT_TAG_GROUPS: Dict[str, List[str]] = _canonize_groups(IMPORTANT_TAG_GROUPS_RAW)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PANNs model loader
+# ──────────────────────────────────────────────────────────────────────────────
 def _pann_model() -> Optional["AudioTagging"]:
     global _PANN_MODEL
     if not _PANN_OK:
@@ -94,568 +373,369 @@ def _pann_model() -> Optional["AudioTagging"]:
         _PANN_MODEL = AudioTagging(device=device, checkpoint_path=None)
     return _PANN_MODEL
 
-def get_audio_tags(audio_path: str, topk_per_group: int = 5) -> Optional[Dict[str, List[Dict[str, Any]]]]:
-    """Get top-N tags from PANNs for each group separately"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tagging (returns full list per group, sorted by probability)
+# ──────────────────────────────────────────────────────────────────────────────
+def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """
+    Returns full list of tags per canonical group (no top-k), sorted by descending probability.
+    Each item includes: label_raw (true PANN), label (pretty), prob.
+    """
     model = _pann_model()
     if model is None:
         return None
-    
+
     try:
-        y, sr = librosa.load(audio_path, sr=32000, mono=True)
-        y_batch = y[np.newaxis, :]  # (1, T)
+        y, _ = librosa.load(audio_path, sr=32000, mono=True)
+        y_batch = y[np.newaxis, :]
         result = model.inference(y_batch)
-        
+
         if isinstance(result, tuple) and len(result) == 2:
             clipwise_probs, _ = result
             probs = clipwise_probs[0] if clipwise_probs.ndim > 1 else clipwise_probs
-            
-            result_groups = {}
-            
-            # Analyze each group separately
-            for group_name, group_tags in IMPORTANT_TAG_GROUPS.items():
-                # Find indices of tags in this group
-                group_indices = []
-                group_labels = []
-                
-                for i, label in enumerate(PANN_LABELS):
-                    if label in group_tags:
-                        group_indices.append(i)
-                        group_labels.append(label)
-                
-                if not group_indices:
-                    result_groups[group_name] = []
-                    continue
-                
-                # Get probabilities only for tags in this group
-                group_probs = probs[group_indices]
-                
-                # Sort by descending probability
-                sorted_indices = np.argsort(-group_probs)
-                
-                # Take top-N for this group
-                top_indices = sorted_indices[:topk_per_group]
-                
-                result_groups[group_name] = [
+
+            out: Dict[str, List[Dict[str, Any]]] = {}
+
+            # Pre-build index of group membership: pann_index -> group_name (multi)
+            label_to_groups: Dict[str, List[str]] = {}
+            for gname, true_list in IMPORTANT_TAG_GROUPS.items():
+                for lbl in true_list:
+                    label_to_groups.setdefault(lbl, []).append(gname)
+
+            # Iterate over all PANN labels and collect those that belong to our groups
+            items_by_group: Dict[str, List[Tuple[str, float]]] = {g: [] for g in IMPORTANT_TAG_GROUPS.keys()}
+            for i, lbl in enumerate(PANN_LABELS):
+                if lbl in label_to_groups:
+                    p = float(probs[i])
+                    for gname in label_to_groups[lbl]:
+                        items_by_group[gname].append((lbl, p))
+
+            # Sort and format
+            for gname, items in items_by_group.items():
+                items.sort(key=lambda x: x[1], reverse=True)
+                out[gname] = [
                     {
-                        "label": group_labels[i], 
-                        "prob": float(group_probs[i])
-                    } 
-                    for i in top_indices
+                        "name": prettify_label(lbl, group_name=gname),
+                        "prob": float(prob)
+                    }
+                    for (lbl, prob) in items
                 ]
-            
-            return result_groups
+
+            return out
+
         return None
     except Exception as e:
         print(f"PANNs error: {e}")
         return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Generic rules expansion (genre/style inference)
+# ──────────────────────────────────────────────────────────────────────────────
+def infer_rule_expansions(
+    pann_groups: Optional[Dict[str, List[Dict[str, Any]]]],
+    features: Dict[str, Any],
+    rules: List[Dict[str, Any]],
+    prob_threshold: float = 0.08
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Apply generic rule expansions to derive labels into target collections (e.g., genre/style).
+    Returns: {"genre": [{"label": ..., "confidence": ...}, ...], "style": [...]}.
+    """
+    present = set()
+    if pann_groups:
+        for _, items in pann_groups.items():
+            for it in items:
+                lbl = it.get("label_raw") or it.get("label")
+                if not lbl:
+                    continue
+                if float(it.get("prob", 0.0)) >= prob_threshold:
+                    present.add(lbl)
 
-# ---------------------------
-# Musical characteristics
-# ---------------------------
-def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
-    """Analyze musical characteristics of a track with improved algorithms"""
-    features = {}
-    
-    try:
-        # === TEMPO (improved algorithm) ===
-        # Use multiple methods and choose the best one
-        tempo_methods = []
-        
-        # Method 1: librosa.beat.tempo (default)
-        tempo1, _ = librosa.beat.beat_track(y=y, sr=sr, units='time')
-        tempo_methods.append(('librosa_default', tempo1))
-        
-        # Method 2: with different parameters
-        tempo2, _ = librosa.beat.beat_track(y=y, sr=sr, units='time', 
-                                           start_bpm=60)
-        tempo_methods.append(('librosa_wide', tempo2))
-        
-        # Method 3: through onset detection
-        onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='time')
-        if len(onset_frames) > 1:
-            intervals = np.diff(onset_frames)
-            # Remove outliers (intervals longer than 2 seconds)
-            intervals = intervals[intervals < 2.0]
-            if len(intervals) > 0:
-                avg_interval = np.median(intervals)
-                tempo3 = 60.0 / avg_interval
-                tempo_methods.append(('onset_based', tempo3))
-        
-        # Choose tempo closer to reasonable range (60-200 BPM)
-        valid_tempos = [(name, t) for name, t in tempo_methods if 60 <= t <= 200]
-        if valid_tempos:
-            # Prefer tempos in range 80-160 BPM
-            preferred_tempos = [(name, t) for name, t in valid_tempos if 80 <= t <= 160]
-            if preferred_tempos:
-                tempo_method, tempo_bpm = preferred_tempos[0]
+    tempo = features.get("tempo_bpm")
+    result: Dict[str, List[Dict[str, Any]]] = {t: [] for t in RULE_TARGETS}
+
+    for rule in rules:
+        target = rule.get("target")
+        if target not in RULE_TARGETS:
+            continue
+
+        include_any = set(rule.get("include_any", []))
+        include_all = set(rule.get("include_all", []))
+        boost = set(rule.get("boost", []))
+        exclude = set(rule.get("exclude", []))
+        tr = rule.get("tempo_bpm_range")
+        weights = rule.get("weights", {})
+        threshold = float(rule.get("threshold", 1.0))
+
+        score = 0.0
+
+        if include_any and any(tag in present for tag in include_any):
+            score += float(weights.get("include_any", 1.0))
+        if include_all and all(tag in present for tag in include_all):
+            score += float(weights.get("include_all", 1.0))
+
+        if boost:
+            n_boost = sum(1 for tag in boost if tag in present)
+            score += n_boost * float(weights.get("boost", 0.0))
+
+        if exclude and any(tag in present for tag in exclude):
+            score -= 1.0
+
+        if tempo and tr and isinstance(tempo, (int, float, np.floating)):
+            lo, hi = tr[0], tr[1]
+            if lo <= float(tempo) <= hi:
+                score += float(weights.get("tempo", 0.0))
             else:
-                tempo_method, tempo_bpm = valid_tempos[0]
+                score -= 0.2
+
+        if score >= threshold:
+            conf = max(0.0, min(1.0, score / (threshold + 1.5)))
+            result[target].append({
+                "label": rule.get("label", ""),
+                "confidence": round(conf, 3)
+            })
+
+    for t in result:
+        result[t].sort(key=lambda x: x["confidence"], reverse=True)
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Musical features (kept as in your previous version)
+# ──────────────────────────────────────────────────────────────────────────────
+def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
+    features = {}
+
+    try:
+        # Tempo
+        tempo_methods = []
+        t1, _ = librosa.beat.beat_track(y=y, sr=sr, units='time')
+        tempo_methods.append(('librosa_default', t1))
+        t2, _ = librosa.beat.beat_track(y=y, sr=sr, units='time', start_bpm=60)
+        tempo_methods.append(('librosa_wide', t2))
+        onset = librosa.onset.onset_detect(y=y, sr=sr, units='time')
+        if len(onset) > 1:
+            iv = np.diff(onset)
+            iv = iv[iv < 2.0]
+            if len(iv) > 0:
+                tempo_methods.append(('onset_based', 60.0 / np.median(iv)))
+
+        valid = [(n, t) for n, t in tempo_methods if 60 <= t <= 200]
+        if valid:
+            pref = [(n, t) for n, t in valid if 80 <= t <= 160]
+            tempo_method, tempo_bpm = (pref[0] if pref else valid[0])
         else:
             tempo_method, tempo_bpm = tempo_methods[0]
-        
-        features["tempo_bpm"] = round(tempo_bpm, 1)
+        features["tempo_bpm"] = round(float(tempo_bpm), 1)
         features["tempo_method"] = tempo_method
-        
-        # === KEY (improved algorithm) ===
-        # Use multiple methods
-        key_methods = []
-        
-        # Method 1: librosa.key (default)
+
+        # Key (voting of multiple methods)
+        key_methods: List[tuple] = []
         try:
-            key1 = librosa.key.estimate_key(y, sr)
-            key_methods.append(('librosa_default', key1))
+            k1 = librosa.key.estimate_key(y, sr)
+            key_methods.append(('librosa_default', k1))
         except:
             pass
-        
-        # Method 2: through chroma with different parameters
         try:
             chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
-            chroma_mean = np.mean(chroma, axis=1)
-            # Find dominant note
-            dominant_note = np.argmax(chroma_mean)
-            note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            key2 = note_names[dominant_note]
-            key_methods.append(('chroma_dominant', key2))
+            cm = np.mean(chroma, axis=1)
+            dom = int(np.argmax(cm))
+            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+            key_methods.append(('chroma_dominant', names[dom]))
         except:
             pass
-        
-        # Method 3: through chroma with weights for major/minor (improved)
         try:
             chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
-            chroma_mean = np.mean(chroma, axis=1)
-            
-            # Более точные веса для мажорных и минорных тональностей
-            # C major: C D E F G A B
-            major_weights = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])  # C major
-            # A minor: A B C D E F G
-            minor_weights = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])  # A minor
-            
-            major_scores = []
-            minor_scores = []
-            
-            for i in range(12):
-                # Поворачиваем веса для каждой тональности
-                major_rotated = np.roll(major_weights, i)
-                minor_rotated = np.roll(minor_weights, i)
-                
-                major_score = np.dot(chroma_mean, major_rotated)
-                minor_score = np.dot(chroma_mean, minor_rotated)
-                
-                major_scores.append(major_score)
-                minor_scores.append(minor_score)
-            
-            # Находим лучшую мажорную и минорную тональности
-            best_major_idx = np.argmax(major_scores)
-            best_minor_idx = np.argmax(minor_scores)
-            
-            note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            
-            if major_scores[best_major_idx] > minor_scores[best_minor_idx]:
-                key3 = note_names[best_major_idx] + ' major'
-            else:
-                key3 = note_names[best_minor_idx] + ' minor'
-            
-            key_methods.append(('chroma_weighted', key3))
+            cm = np.mean(chroma, axis=1)
+            maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
+            mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
+            maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
+            min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
+            bi_maj = int(np.argmax(maj_scores))
+            bi_min = int(np.argmax(min_scores))
+            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+            key_methods.append((
+                'chroma_weighted',
+                names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] else names[bi_min] + ' minor'
+            ))
         except:
             pass
-        
-        # Метод 4: через chroma с CQT (Constant-Q Transform) - более точный
         try:
-            chroma_cqt = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12)
-            chroma_cqt_mean = np.mean(chroma_cqt, axis=1)
-            
-            # Используем те же веса
-            major_weights = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-            minor_weights = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-            
-            major_scores = []
-            minor_scores = []
-            
-            for i in range(12):
-                major_rotated = np.roll(major_weights, i)
-                minor_rotated = np.roll(minor_weights, i)
-                
-                major_score = np.dot(chroma_cqt_mean, major_rotated)
-                minor_score = np.dot(chroma_cqt_mean, minor_rotated)
-                
-                major_scores.append(major_score)
-                minor_scores.append(minor_score)
-            
-            best_major_idx = np.argmax(major_scores)
-            best_minor_idx = np.argmax(minor_scores)
-            
-            note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            
-            if major_scores[best_major_idx] > minor_scores[best_minor_idx]:
-                key4 = note_names[best_major_idx] + ' major'
-            else:
-                key4 = note_names[best_minor_idx] + ' minor'
-            
-            key_methods.append(('chroma_cqt', key4))
+            cqt = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12)
+            cm = np.mean(cqt, axis=1)
+            maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
+            mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
+            maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
+            min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
+            bi_maj = int(np.argmax(maj_scores))
+            bi_min = int(np.argmax(min_scores))
+            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+            key_methods.append((
+                'chroma_cqt',
+                names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] else names[bi_min] + ' minor'
+            ))
         except:
             pass
-        
-        # Метод 5: через chroma с CENS (Chroma Energy Normalized Statistics)
         try:
-            chroma_cens = librosa.feature.chroma_cens(y=y, sr=sr, n_chroma=12)
-            chroma_cens_mean = np.mean(chroma_cens, axis=1)
-            
-            major_weights = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-            minor_weights = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-            
-            major_scores = []
-            minor_scores = []
-            
-            for i in range(12):
-                major_rotated = np.roll(major_weights, i)
-                minor_rotated = np.roll(minor_weights, i)
-                
-                major_score = np.dot(chroma_cens_mean, major_rotated)
-                minor_score = np.dot(chroma_cens_mean, minor_rotated)
-                
-                major_scores.append(major_score)
-                minor_scores.append(minor_score)
-            
-            best_major_idx = np.argmax(major_scores)
-            best_minor_idx = np.argmax(minor_scores)
-            
-            note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            
-            if major_scores[best_major_idx] > minor_scores[best_minor_idx]:
-                key5 = note_names[best_major_idx] + ' major'
-            else:
-                key5 = note_names[best_minor_idx] + ' minor'
-            
-            key_methods.append(('chroma_cens', key5))
+            cens = librosa.feature.chroma_cens(y=y, sr=sr, n_chroma=12)
+            cm = np.mean(cens, axis=1)
+            maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
+            mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
+            maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
+            min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
+            bi_maj = int(np.argmax(maj_scores))
+            bi_min = int(np.argmax(min_scores))
+            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+            key_methods.append((
+                'chroma_cens',
+                names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] else names[bi_min] + ' minor'
+            ))
         except:
             pass
-        
-        # Метод 6: Улучшенный анализ через гармонические частоты
         try:
-            # Используем более точный анализ гармоник
-            chroma_harmonic = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12, n_fft=4096, hop_length=512)
-            chroma_harmonic_mean = np.mean(chroma_harmonic, axis=1)
-            
-            # Более точные веса для мажорных и минорных тональностей
-            # C major: C D E F G A B (1 0 1 0 1 1 0 1 0 1 0 1)
-            major_weights = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-            # A minor: A B C D E F G (1 0 1 1 0 1 0 1 1 0 1 0)
-            minor_weights = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-            
-            major_scores = []
-            minor_scores = []
-            
-            for i in range(12):
-                major_rotated = np.roll(major_weights, i)
-                minor_rotated = np.roll(minor_weights, i)
-                
-                major_score = np.dot(chroma_harmonic_mean, major_rotated)
-                minor_score = np.dot(chroma_harmonic_mean, minor_rotated)
-                
-                major_scores.append(major_score)
-                minor_scores.append(minor_score)
-            
-            best_major_idx = np.argmax(major_scores)
-            best_minor_idx = np.argmax(minor_scores)
-            
-            note_names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            
-            if major_scores[best_major_idx] > minor_scores[best_minor_idx]:
-                key6 = note_names[best_major_idx] + ' major'
-            else:
-                key6 = note_names[best_minor_idx] + ' minor'
-            
-            key_methods.append(('chroma_harmonic', key6))
-        except:
-            pass
-        
-        # Метод 7: Анализ через спектральные пики
-        try:
-            # Ищем доминирующие частоты
+            # simple spectral peak heuristic
             fft = np.fft.fft(y)
             freqs = np.fft.fftfreq(len(y), 1/sr)
-            
-            # Берем только положительные частоты
-            positive_freqs = freqs[:len(freqs)//2]
-            positive_fft = np.abs(fft[:len(fft)//2])
-            
-            # Ищем пики в спектре
+            pf = freqs[:len(freqs)//2]
+            pa = np.abs(fft[:len(fft)//2])
             from scipy.signal import find_peaks
-            peaks, _ = find_peaks(positive_fft, height=np.max(positive_fft)*0.1)
-            
+            peaks, _ = find_peaks(pa, height=np.max(pa)*0.1)
             if len(peaks) > 0:
-                # Находим доминирующую частоту
-                dominant_freq = positive_freqs[peaks[np.argmax(positive_fft[peaks])]]
-                
-                # Конвертируем частоту в ноту
-                # A4 = 440 Hz
-                a4_freq = 440.0
-                note_offset = 12 * np.log2(dominant_freq / a4_freq)
-                note_index = int(round(note_offset)) % 12
-                
-                note_names = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#']
-                dominant_note = note_names[note_index]
-                
-                key_methods.append(('spectral_peaks', dominant_note))
+                dom = pf[peaks[np.argmax(pa[peaks])]]
+                a4 = 440.0
+                off = 12 * np.log2(max(dom, 1e-12) / a4)
+                idx = int(np.round(off)) % 12
+                names = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#']
+                key_methods.append(('spectral_peaks', names[idx]))
         except:
             pass
-        
-        # Выбираем лучшую тональность (улучшенный алгоритм)
+
         if key_methods:
-            # Подсчитываем голоса за каждую тональность
-            key_votes = {}
-            method_weights = {
-                'chroma_harmonic': 3,
+            key_votes: Dict[str, float] = {}
+            method_w = {
                 'chroma_cqt': 2.5,
                 'chroma_cens': 2.5,
-                'chroma_weighted': 2,
+                'chroma_weighted': 2.0,
                 'librosa_default': 1.5,
-                'spectral_peaks': 1,
-                'chroma_dominant': 0.5
+                'spectral_peaks': 1.0,
+                'chroma_dominant': 0.5,
             }
-            
-            for method, key in key_methods:
-                weight = method_weights.get(method, 1)
-                if key in key_votes:
-                    key_votes[key] += weight
-                else:
-                    key_votes[key] = weight
-            
-            # Выбираем тональность с наибольшим весом
+            for m, k in key_methods:
+                key_votes[k] = key_votes.get(k, 0.0) + method_w.get(m, 1.0)
             best_key = max(key_votes, key=key_votes.get)
-            
-            # Находим метод, который дал эту тональность
-            for method, key in key_methods:
-                if key == best_key:
-                    key_method, key = method, key
-                    break
+            key_method = next((m for m, k in key_methods if k == best_key), 'vote')
+            features["key"] = best_key
+            features["key_method"] = key_method
         else:
-            key_method, key = 'unknown', 'Unknown'
-        
-        features["key"] = key
-        features["key_method"] = key_method
-        
-        # === РАЗМЕР (кардинально улучшенный алгоритм) ===
-        # Анализируем акценты и паттерны ударений
-        time_sig_methods = []
-        
-        # Метод 1: Анализ акцентированных битов через RMS
+            features["key"] = "Unknown"
+            features["key_method"] = "unknown"
+
+        # Time signature (heuristics)
+        methods_ts = []
         try:
-            # Разбиваем на фреймы по 1 секунде
             frame_length = sr
             hop_length = frame_length // 4
-            
             rms_frames = []
             for i in range(0, len(y) - frame_length, hop_length):
                 frame = y[i:i + frame_length]
-                rms = np.sqrt(np.mean(frame**2))
-                rms_frames.append(rms)
-            
+                rms_frames.append(np.sqrt(np.mean(frame**2)))
             if len(rms_frames) > 8:
-                # Ищем паттерны акцентов (каждый 4-й бит сильнее в 4/4)
-                rms_array = np.array(rms_frames)
-                
-                # Нормализуем RMS
-                rms_norm = (rms_array - np.mean(rms_array)) / np.std(rms_array)
-                
-                # Ищем периодичность в акцентах
-                # Для 4/4: акценты каждые 4 бита
-                # Для 3/4: акценты каждые 3 бита
-                
-                # Проверяем 4/4 (акценты каждые 4 фрейма)
-                accent_4_4 = 0
-                for i in range(0, len(rms_norm) - 4, 4):
-                    if rms_norm[i] > np.mean(rms_norm[i:i+4]) + 0.5:
-                        accent_4_4 += 1
-                
-                # Проверяем 3/4 (акценты каждые 3 фрейма)
-                accent_3_4 = 0
-                for i in range(0, len(rms_norm) - 3, 3):
-                    if rms_norm[i] > np.mean(rms_norm[i:i+3]) + 0.5:
-                        accent_3_4 += 1
-                
-                # Выбираем размер с большим количеством акцентов
-                if accent_4_4 > accent_3_4:
-                    time_sig_methods.append(('accent_analysis', '4/4'))
-                else:
-                    time_sig_methods.append(('accent_analysis', '3/4'))
+                arr = np.array(rms_frames)
+                arr = (arr - np.mean(arr)) / (np.std(arr) + 1e-12)
+                a44 = sum(1 for i in range(0, len(arr) - 4, 4) if arr[i] > np.mean(arr[i:i+4]) + 0.5)
+                a34 = sum(1 for i in range(0, len(arr) - 3, 3) if arr[i] > np.mean(arr[i:i+3]) + 0.5)
+                methods_ts.append(('accent_analysis', '4/4' if a44 > a34 else '3/4'))
         except:
             pass
-        
-        # Метод 2: Анализ через onset detection с группировкой
         try:
-            onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='time')
-            if len(onset_frames) > 12:
-                # Группируем onset'ы по тактам
-                onset_intervals = np.diff(onset_frames)
-                
-                # Ищем регулярные паттерны
-                # Для 4/4: 4 сильных onset'а на такт
-                # Для 3/4: 3 сильных onset'а на такт
-                
-                # Анализируем интервалы между onset'ами
-                avg_interval = np.median(onset_intervals)
-                
-                # Группируем onset'ы по тактам
-                beats_per_measure_4_4 = 0
-                beats_per_measure_3_4 = 0
-                
-                for i in range(0, len(onset_intervals) - 3, 4):
-                    if i + 3 < len(onset_intervals):
-                        # Проверяем паттерн 4/4
-                        if (onset_intervals[i] < avg_interval * 1.5 and 
-                            onset_intervals[i+1] < avg_interval * 1.5 and
-                            onset_intervals[i+2] < avg_interval * 1.5 and
-                            onset_intervals[i+3] > avg_interval * 1.5):
-                            beats_per_measure_4_4 += 1
-                
-                for i in range(0, len(onset_intervals) - 2, 3):
-                    if i + 2 < len(onset_intervals):
-                        # Проверяем паттерн 3/4
-                        if (onset_intervals[i] < avg_interval * 1.5 and 
-                            onset_intervals[i+1] < avg_interval * 1.5 and
-                            onset_intervals[i+2] > avg_interval * 1.5):
-                            beats_per_measure_3_4 += 1
-                
-                if beats_per_measure_4_4 > beats_per_measure_3_4:
-                    time_sig_methods.append(('onset_grouping', '4/4'))
-                else:
-                    time_sig_methods.append(('onset_grouping', '3/4'))
+            onset = librosa.onset.onset_detect(y=y, sr=sr, units='time')
+            if len(onset) > 12:
+                ints = np.diff(onset)
+                avg = np.median(ints)
+                b4 = 0
+                for i in range(0, len(ints) - 3, 4):
+                    if i + 3 < len(ints):
+                        if (ints[i] < avg * 1.5 and ints[i+1] < avg * 1.5 and
+                            ints[i+2] < avg * 1.5 and ints[i+3] > avg * 1.5):
+                            b4 += 1
+                b3 = 0
+                for i in range(0, len(ints) - 2, 3):
+                    if i + 2 < len(ints):
+                        if (ints[i] < avg * 1.5 and ints[i+1] < avg * 1.5 and
+                            ints[i+2] > avg * 1.5):
+                            b3 += 1
+                methods_ts.append(('onset_grouping', '4/4' if b4 > b3 else '3/4'))
         except:
             pass
-        
-        # Метод 3: Анализ через спектральные характеристики
         try:
-            # Анализируем спектральные изменения каждые 4 и 3 бита
             chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-            chroma_mean = np.mean(chroma, axis=0)
-            
-            # Ищем периодичность в спектральных изменениях
-            # Для 4/4: изменения каждые 4 фрейма
-            # Для 3/4: изменения каждые 3 фрейма
-            
-            chroma_diff = np.diff(chroma_mean)
-            chroma_diff_abs = np.abs(chroma_diff)
-            
-            # Проверяем периодичность 4/4
-            period_4_4 = 0
-            for i in range(0, len(chroma_diff_abs) - 4, 4):
-                if np.std(chroma_diff_abs[i:i+4]) > np.mean(chroma_diff_abs):
-                    period_4_4 += 1
-            
-            # Проверяем периодичность 3/4
-            period_3_4 = 0
-            for i in range(0, len(chroma_diff_abs) - 3, 3):
-                if np.std(chroma_diff_abs[i:i+3]) > np.mean(chroma_diff_abs):
-                    period_3_4 += 1
-            
-            if period_4_4 > period_3_4:
-                time_sig_methods.append(('spectral_periodicity', '4/4'))
-            else:
-                time_sig_methods.append(('spectral_periodicity', '3/4'))
+            cm = np.mean(chroma, axis=0)
+            diff = np.abs(np.diff(cm))
+            p44 = sum(1 for i in range(0, len(diff) - 4, 4) if np.std(diff[i:i+4]) > np.mean(diff))
+            p34 = sum(1 for i in range(0, len(diff) - 3, 3) if np.std(diff[i:i+3]) > np.mean(diff))
+            methods_ts.append(('spectral_periodicity', '4/4' if p44 > p34 else '3/4'))
         except:
             pass
-        
-        # Метод 4: Простой анализ через ударные (kick drum detection)
         try:
-            # Ищем низкочастотные компоненты (kick drum)
-            # Kick drum обычно в диапазоне 60-80 Hz
-            low_freq = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=2048, hop_length=512)[0]
-            
-            # Фильтруем только низкие частоты
-            low_freq_filtered = low_freq[low_freq < 200]
-            
-            if len(low_freq_filtered) > 8:
-                # Ищем периодичность в низкочастотных компонентах
-                # Для 4/4: kick каждые 4 бита
-                # Для 3/4: kick каждые 3 бита
-                
-                # Простая эвристика: если много низкочастотных пиков, то 4/4
-                low_freq_peaks = 0
-                for i in range(0, len(low_freq_filtered) - 4, 4):
-                    if np.std(low_freq_filtered[i:i+4]) > np.mean(low_freq_filtered):
-                        low_freq_peaks += 1
-                
-                if low_freq_peaks > len(low_freq_filtered) // 8:
-                    time_sig_methods.append(('kick_drum_analysis', '4/4'))
-                else:
-                    time_sig_methods.append(('kick_drum_analysis', '3/4'))
+            low_centroid = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=2048, hop_length=512)[0]
+            low = low_centroid[low_centroid < 200]
+            if len(low) > 8:
+                peaks4 = sum(1 for i in range(0, len(low) - 4, 4) if np.std(low[i:i+4]) > np.mean(low))
+                methods_ts.append(('kick_drum_analysis', '4/4' if peaks4 > len(low) // 8 else '3/4'))
         except:
             pass
-        
-        # Метод 5: Анализ через темп (простая эвристика)
         try:
-            # Если темп очень медленный (< 60 BPM), вероятно 3/4
-            # Если темп нормальный (60-180 BPM), вероятно 4/4
-            if tempo_bpm < 60:
-                time_sig_methods.append(('tempo_heuristic', '3/4'))
+            if float(features["tempo_bpm"]) < 60:
+                methods_ts.append(('tempo_heuristic', '3/4'))
             else:
-                time_sig_methods.append(('tempo_heuristic', '4/4'))
+                methods_ts.append(('tempo_heuristic', '4/4'))
         except:
             pass
-        
-        # Выбираем размер (предпочитаем 4/4 как наиболее распространенный)
-        if time_sig_methods:
-            # Подсчитываем голоса за каждый размер
-            votes_4_4 = sum(1 for method, sig in time_sig_methods if sig == '4/4')
-            votes_3_4 = sum(1 for method, sig in time_sig_methods if sig == '3/4')
-            
 
-            
-            # Требуем явного большинства для 3/4 (3/4 встречается реже)
-            if votes_3_4 > votes_4_4 * 1.5:  # 3/4 должно быть значительно больше
-                time_sig_method, time_signature = 'majority_vote', '3/4'
-            else:
-                time_sig_method, time_signature = 'majority_vote', '4/4'
+        if methods_ts:
+            v4 = sum(1 for _, s in methods_ts if s == '4/4')
+            v3 = sum(1 for _, s in methods_ts if s == '3/4')
+            ts = '3/4' if v3 > v4 * 1.5 else '4/4'
+            features["time_signature"] = ts
+            features["time_sig_method"] = "majority_vote"
         else:
-            time_sig_method, time_signature = 'default', '4/4'
-        
-        features["time_signature"] = time_signature
-        features["time_sig_method"] = time_sig_method
-            
-        # === ОСТАЛЬНЫЕ ХАРАКТЕРИСТИКИ ===
-        # Энергия
+            features["time_signature"] = "4/4"
+            features["time_sig_method"] = "default"
+
+        # Other features
         rms = librosa.feature.rms(y=y)[0]
         features["energy"] = round(float(np.mean(rms)), 3)
-        
-        # Спектральный центроид (яркость)
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        features["brightness"] = round(float(np.mean(spectral_centroids)), 1)
-        
-        # Ноль-кроссинги (индикатор перкуссии/шума)
+        sc = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        features["brightness"] = round(float(np.mean(sc)), 1)
         zcr = librosa.feature.zero_crossing_rate(y)[0]
         features["zero_crossing_rate"] = round(float(np.mean(zcr)), 3)
-        
-        # Спектральный rolloff
-        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-        features["spectral_rolloff"] = round(float(np.mean(rolloff)), 1)
-        
-        # MFCC для тембральных характеристик
+        roll = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+        features["spectral_rolloff"] = round(float(np.mean(roll)), 1)
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         features["mfcc_mean"] = [round(float(x), 3) for x in np.mean(mfccs, axis=1)]
-        
+
     except Exception as e:
         print(f"Feature analysis error: {e}")
         features["error"] = str(e)
-        
+
     return features
 
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # FastAPI
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Audio Analysis API", 
-    version="2.0.0",
-    description="Audio analysis microservice with queue support"
+    title="Audio Analysis API",
+    version="2.2.0",
+    description="Audio analysis microservice with PANNs tagging + feature extraction + rules"
 )
 
-# Add CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production specify specific domains
+    allow_origins=["*"],  # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -664,59 +744,50 @@ app.add_middleware(
 
 @app.post("/analyze")
 async def analyze_track(
-    file: UploadFile = File(...),
-    top_tags_per_group: int = 5
+    file: UploadFile = File(...)
 ):
     """
-    Analyzes audio file and returns:
-    - PANNs tags by groups (musical genres, instruments, vocals)
-    - Musical characteristics (tempo, key, time signature, etc.)
-    
-    All temporary files are deleted after analysis.
+    Analyze audio file and return:
+      - full PANNs tags grouped by canonical groups (no top-k)
+      - musical features
+      - inferred expansions (genre/style) via rules
     """
     if not file.filename.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
         raise HTTPException(400, "Unsupported file type")
-    
+
     t0 = time.time()
     temp_path = None
-    
+
     try:
-        # Save to temporary file
         with tempfile.NamedTemporaryFile(
-            suffix=os.path.splitext(file.filename)[1] or ".wav", 
+            suffix=os.path.splitext(file.filename)[1] or ".wav",
             delete=False
         ) as tmp:
             content = await file.read()
             tmp.write(content)
             temp_path = tmp.name
-        
-        # Load audio
+
         y, sr = librosa.load(temp_path, sr=None, mono=True)
-        
-        # Get PANNs tags by groups
-        tags = get_audio_tags(temp_path, topk_per_group=top_tags_per_group)
-        
-        # Analyze musical characteristics
+
+        tags = get_audio_tags(temp_path)
         features = analyze_audio_features(y, sr)
-        
-        # Track duration
+        inferred = infer_rule_expansions(tags, features, CUSTOM_RULES)
+
         duration = float(len(y) / sr)
-        
-        result = {
+
+        return JSONResponse({
             "filename": file.filename,
             "duration_seconds": duration,
             "tags": tags,
             "musical_features": features,
+            "inferred": inferred,
             "elapsed_sec": round(time.time() - t0, 3)
-        }
-        
-        return JSONResponse(result)
-        
+        })
+
     except Exception as e:
         raise HTTPException(500, f"Analysis failed: {str(e)}")
-        
+
     finally:
-        # MUST delete temporary file
         if temp_path and os.path.exists(temp_path):
             try:
                 os.unlink(temp_path)
@@ -728,22 +799,25 @@ async def analyze_track(
 def root():
     return {
         "service": "Audio Tags & Features API",
-        "version": "1.0.0",
+        "version": "3.0.0",
         "endpoints": {
-            "POST /analyze": "Анализ аудио: PANNs теги + музыкальные характеристики",
+            "POST /analyze": "Synchronous audio analysis: PANNs tags + musical features + rule expansions",
+            "GET /tags": "Canonical groups (true PANN/AudioSet labels)",
+            "GET /tags/pretty": "Groups with pretty display names",
         },
         "features": [
-            "PANNs audio tagging (527 classes)",
-            "Tempo (BPM) detection", 
-            "Key detection",
-            "Time signature estimation",
-            "Energy, brightness, spectral features",
-            "No persistent storage - temporary analysis only"
-        ]
+            "Synchronous analysis for immediate results",
+            "PANNs audio tagging with curated musical tags",
+            "Musical feature extraction (tempo, key, time signature)",
+            "Rule-based tag expansion",
+            "External queue integration (configurable)"
+        ],
+        "queue_config_hint": "Set QUEUE_TYPE and connection URLs to enable external queue in the future"
     }
+
+
 @app.get("/tags")
-def get_important_tag_groups():
-    """Получить группы музыкальных тегов"""
+def get_canonical_tag_groups():
     return {
         "total_tags": sum(len(tags) for tags in IMPORTANT_TAG_GROUPS.values()),
         "categories": {key: len(tags) for key, tags in IMPORTANT_TAG_GROUPS.items()},
@@ -751,121 +825,21 @@ def get_important_tag_groups():
     }
 
 
-# ---------------------------
-# Queue endpoints
-# ---------------------------
-
-@app.post("/analyze/async")
-async def analyze_track_async(
-    file: UploadFile = File(...),
-    top_tags_per_group: int = 5
-):
-    """
-    Start asynchronous audio file analysis through queue
-    
-    Returns task_id for progress tracking
-    """
-    if not QUEUE_AVAILABLE:
-        raise HTTPException(503, "Queue system not available")
-        
-    if not file.filename.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
-        raise HTTPException(400, "Unsupported file type")
-    
-    try:
-        # Import tasks here to avoid circular import
-        from .tasks import analyze_audio_file
-        
-        # Read file
-        file_data = await file.read()
-        
-        # Start task in queue
-        task = analyze_audio_file.delay(file_data, file.filename, top_tags_per_group)
-        
-        return {
-            "task_id": task.id,
-            "filename": file.filename,
-            "status": "queued",
-            "message": "Task queued for processing"
-        }
-        
-    except Exception as e:
-        raise HTTPException(500, f"Failed to queue task: {str(e)}")
+@app.get("/tags/pretty")
+def get_pretty_tag_groups():
+    pretty: Dict[str, List[str]] = {}
+    for g, tags in IMPORTANT_TAG_GROUPS.items():
+        pretty[g] = [prettify_label(lbl, group_name=g) for lbl in tags]
+    return {
+        "total_tags": sum(len(tags) for tags in pretty.values()),
+        "categories": {key: len(tags) for key, tags in pretty.items()},
+        "tags": pretty
+    }
 
 
-@app.get("/analyze/status/{task_id}")
-def get_task_status(task_id: str):
-    """
-    Get analysis task status
-    
-    Args:
-        task_id: Task ID from /analyze/async
-        
-    Returns:
-        Status and result (if ready)
-    """
-    if not QUEUE_AVAILABLE:
-        raise HTTPException(503, "Queue system not available")
-    
-    try:
-        result = celery_app.AsyncResult(task_id)
-        
-        if result.state == 'PENDING':
-            return {
-                'task_id': task_id,
-                'status': 'pending', 
-                'message': 'Task is waiting to be processed'
-            }
-        elif result.state == 'PROCESSING':
-            return {
-                'task_id': task_id,
-                'status': 'processing',
-                'stage': result.info.get('stage', 'unknown'),
-                'message': f"Task is being processed: {result.info.get('stage', 'unknown')}"
-            }
-        elif result.state == 'SUCCESS':
-            return {
-                'task_id': task_id,
-                'status': 'completed', 
-                'result': result.result
-            }
-        elif result.state == 'FAILURE':
-            return {
-                'task_id': task_id,
-                'status': 'failed',
-                'error': str(result.info),
-                'message': 'Task failed to complete'
-            }
-        else:
-            return {
-                'task_id': task_id,
-                'status': result.state, 
-                'message': f'Task state: {result.state}'
-            }
-            
-    except Exception as e:
-        raise HTTPException(500, f"Failed to get task status: {str(e)}")
+# ──────────────────────────────────────────────────────────────────────────────
+# External Queue Integration
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-@app.get("/queue/info")
-def get_queue_info():
-    """Queue status information"""
-    if not QUEUE_AVAILABLE:
-        return {"queue_available": False, "message": "Queue system not available"}
-    
-    try:
-        # Get Celery information
-        stats = celery_app.control.inspect().stats()
-        active = celery_app.control.inspect().active()
-        
-        return {
-            "queue_available": True,
-            "workers": stats,
-            "active_tasks": active,
-            "message": "Queue system is operational"
-        }
-    except Exception as e:
-        return {
-            "queue_available": False,
-            "error": str(e),
-            "message": "Queue system error"
-        }
+# External queue endpoints removed for now. Future integration can reuse
+# form parameters and async handlers here.

@@ -3,10 +3,7 @@ fastapi==0.110.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 
-# Система очередей
-celery==5.3.4
-redis==5.0.1
-flower==2.0.1
+# (Optional) External queue deps can be added later (redis, pika, httpx)
 
 # Аудио обработка
 numpy==1.26.4

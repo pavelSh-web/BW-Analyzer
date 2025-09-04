@@ -33,9 +33,9 @@ COPY requirements.txt ./
 
 # Install Python deps
 # Note: torch/torchaudio CPU wheels come from the extra index url in requirements.txt
-ENV PIP_NO_CACHE_DIR=1
-RUN python -m pip install --upgrade pip \
-    && pip install -r requirements.txt
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app ./app
