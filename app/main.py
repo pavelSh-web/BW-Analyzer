@@ -32,7 +32,7 @@ _PANN_MODEL: Optional["AudioTagging"] = None
 #    These lists should contain real AudioSet labels whenever possible.
 #    Any label not found in PANN_LABELS will be dropped during canonization.
 # ──────────────────────────────────────────────────────────────────────────────
-IMPORTANT_TAG_GROUPS_RAW: Dict[str, List[str]] = {
+TAG_GROUPS: Dict[str, List[str]] = {
     "genre": [
         "Pop music", "Rock music", "Hip hop music", "Jazz", "Blues",
         "Country", "Electronic music", "Classical music", "Folk music", "Reggae",
@@ -61,13 +61,15 @@ IMPORTANT_TAG_GROUPS_RAW: Dict[str, List[str]] = {
     ],
     "atmosphere": [
         "Drone", "Noise", "Buzz", "Hiss", "Hum", "Rumble",
-        "Whoosh, swoosh", "Reverberation", "Echo", "Silence",
+        "Whoosh, swoosh", "Silence",
         "Environmental noise", "Crackle", "Click", "Sizzle",
         "Applause", "Cheering", "Crowd", "Chatter"
     ],
-    "spectral": [
-        "Distortion", "Audio clipping",
-        "Chorus effect", "Flanger"
+    "effects": [
+        "Echo",
+        "Reverberation",
+        "Distortion",
+        "Chorus effect"
     ],
     "style": [
         "Jingle, tinkle",
@@ -358,7 +360,7 @@ def prettify_label(label_raw: str, group_name: Optional[str] = None) -> str:
     return label_raw
 
 
-IMPORTANT_TAG_GROUPS: Dict[str, List[str]] = _canonize_groups(IMPORTANT_TAG_GROUPS_RAW)
+BW_TAG_GROUPS: Dict[str, List[str]] = _canonize_groups(TAG_GROUPS)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -399,12 +401,12 @@ def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]
 
             # Pre-build index of group membership: pann_index -> group_name (multi)
             label_to_groups: Dict[str, List[str]] = {}
-            for gname, true_list in IMPORTANT_TAG_GROUPS.items():
+            for gname, true_list in BW_TAG_GROUPS.items():
                 for lbl in true_list:
                     label_to_groups.setdefault(lbl, []).append(gname)
 
             # Iterate over all PANN labels and collect those that belong to our groups
-            items_by_group: Dict[str, List[Tuple[str, float]]] = {g: [] for g in IMPORTANT_TAG_GROUPS.keys()}
+            items_by_group: Dict[str, List[Tuple[str, float]]] = {g: [] for g in BW_TAG_GROUPS.keys()}
             for i, lbl in enumerate(PANN_LABELS):
                 if lbl in label_to_groups:
                     p = float(probs[i])
@@ -417,7 +419,7 @@ def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]
                 out[gname] = [
                     {
                         "name": prettify_label(lbl, group_name=gname),
-                        "prob": float(prob)
+                        "prob": round(float(prob), 10)
                     }
                     for (lbl, prob) in items
                 ]
@@ -819,16 +821,16 @@ def root():
 @app.get("/tags")
 def get_canonical_tag_groups():
     return {
-        "total_tags": sum(len(tags) for tags in IMPORTANT_TAG_GROUPS.values()),
-        "categories": {key: len(tags) for key, tags in IMPORTANT_TAG_GROUPS.items()},
-        "tags": IMPORTANT_TAG_GROUPS
+        "total_tags": sum(len(tags) for tags in BW_TAG_GROUPS.values()),
+        "categories": {key: len(tags) for key, tags in BW_TAG_GROUPS.items()},
+        "tags": BW_TAG_GROUPS
     }
 
 
 @app.get("/tags/pretty")
 def get_pretty_tag_groups():
     pretty: Dict[str, List[str]] = {}
-    for g, tags in IMPORTANT_TAG_GROUPS.items():
+    for g, tags in BW_TAG_GROUPS.items():
         pretty[g] = [prettify_label(lbl, group_name=g) for lbl in tags]
     return {
         "total_tags": sum(len(tags) for tags in pretty.values()),
@@ -837,9 +839,3 @@ def get_pretty_tag_groups():
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# External Queue Integration
-# ──────────────────────────────────────────────────────────────────────────────
-
-# External queue endpoints removed for now. Future integration can reuse
-# form parameters and async handlers here.
