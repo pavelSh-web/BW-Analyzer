@@ -1,5 +1,5 @@
 # Base image
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 # Prevent interactive prompts during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
@@ -21,6 +21,7 @@ RUN apt-get update \
        gcc \
        libgl1 \
        wget \
+       git \
     && rm -rf /var/lib/apt/lists/*
 
 # Create PANNs data directory and download required files

@@ -1,8 +1,12 @@
 import os
 import re
+import json
 import time
+import shlex
 import tempfile
-from typing import List, Optional, Dict, Any
+import subprocess
+from shutil import which
+from typing import List, Optional, Dict, Any, Tuple
 
 import numpy as np
 import librosa
@@ -26,11 +30,27 @@ except Exception:
 
 _PANN_MODEL: Optional["AudioTagging"] = None
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DeepRhythm (tempo primary)
+# ──────────────────────────────────────────────────────────────────────────────
+_DR_OK = False
+_DR_VERSION = None
+_DR_MODEL = None
+try:
+    from deeprhythm import DeepRhythmPredictor
+    _DR_OK = True
+    try:
+        import deeprhythm
+        _DR_VERSION = getattr(deeprhythm, "__version__", None)
+    except Exception:
+        _DR_VERSION = None
+except Exception:
+    DeepRhythmPredictor = None
+    _DR_OK = False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) Human seed groups (will be canonized to true PANN labels)
-#    These lists should contain real AudioSet labels whenever possible.
-#    Any label not found in PANN_LABELS will be dropped during canonization.
+# 1) Human seed groups → canonize to true PANN labels only (no synonyms)
 # ──────────────────────────────────────────────────────────────────────────────
 TAG_GROUPS: Dict[str, List[str]] = {
     "genre": [
@@ -81,10 +101,7 @@ TAG_GROUPS: Dict[str, List[str]] = {
     ]
 }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2) Display aliases (UI only). Do not affect matching or group canonization.
-# ──────────────────────────────────────────────────────────────────────────────
+# UI aliases (display only)
 DISPLAY_ALIASES: Dict[str, str] = {
     "Violin, fiddle": "Violin",
     "Whoosh, swoosh": "Whoosh",
@@ -93,15 +110,13 @@ DISPLAY_ALIASES: Dict[str, str] = {
     "A capella": "A cappella",
     "Rhythm and blues": "R&B",
     "Keyboard (musical)": "Keyboard",
+    "Christian music": "Inspirational",
 }
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3) Rules engine (generic). We expand to targets (e.g., genre, style).
-#    All rule tag names must be true PANN labels.
-# ──────────────────────────────────────────────────────────────────────────────
+# Rules engine targets
 RULE_TARGETS = ("genre", "style")
 
+# Custom rules (all tag names must be true PANN labels)
 CUSTOM_RULES: List[Dict[str, Any]] = [
     # Modern / alt genres
     {
@@ -187,7 +202,6 @@ CUSTOM_RULES: List[Dict[str, Any]] = [
         "weights": {"include_any": 1.0, "include_all": 1.0, "boost": 0.5, "tempo": 0.0},
         "threshold": 1.0
     },
-
     # Hip hop / jazz adjacent
     {
         "label": "Lo-fi hip hop",
@@ -269,7 +283,7 @@ CUSTOM_RULES: List[Dict[str, Any]] = [
         "threshold": 1.25
     },
 
-    # Styles (target: style)
+    # Styles
     {
         "label": "Vinyl texture",
         "target": "style",
@@ -328,12 +342,9 @@ INDEX_NORM_TO_TRUE: Dict[str, str] = _build_label_index() if _PANN_OK else {}
 def _canonize_groups(raw: Dict[str, List[str]]) -> Dict[str, List[str]]:
     """
     Keep only labels that exist in PANN_LABELS. Drop the rest.
-    No synonym mapping is applied here by design.
     """
     if not _PANN_OK:
-        # Model/labels not available at import time: return raw as-is.
         return raw
-
     groups: Dict[str, List[str]] = {}
     for g, tags in raw.items():
         out: List[str] = []
@@ -377,7 +388,7 @@ def _pann_model() -> Optional["AudioTagging"]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tagging (returns full list per group, sorted by probability)
+# Tagging (full list per group, sorted by probability)
 # ──────────────────────────────────────────────────────────────────────────────
 def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]:
     """
@@ -399,13 +410,11 @@ def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]
 
             out: Dict[str, List[Dict[str, Any]]] = {}
 
-            # Pre-build index of group membership: pann_index -> group_name (multi)
             label_to_groups: Dict[str, List[str]] = {}
             for gname, true_list in BW_TAG_GROUPS.items():
                 for lbl in true_list:
                     label_to_groups.setdefault(lbl, []).append(gname)
 
-            # Iterate over all PANN labels and collect those that belong to our groups
             items_by_group: Dict[str, List[Tuple[str, float]]] = {g: [] for g in BW_TAG_GROUPS.keys()}
             for i, lbl in enumerate(PANN_LABELS):
                 if lbl in label_to_groups:
@@ -413,12 +422,11 @@ def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]
                     for gname in label_to_groups[lbl]:
                         items_by_group[gname].append((lbl, p))
 
-            # Sort and format
             for gname, items in items_by_group.items():
                 items.sort(key=lambda x: x[1], reverse=True)
                 out[gname] = [
                     {
-                        "name": prettify_label(lbl, group_name=gname),
+                        "label": prettify_label(lbl, group_name=gname),
                         "prob": round(float(prob), 10)
                     }
                     for (lbl, prob) in items
@@ -433,23 +441,22 @@ def get_audio_tags(audio_path: str) -> Optional[Dict[str, List[Dict[str, Any]]]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Generic rules expansion (genre/style inference)
+# Rules expansion (genre/style)
 # ──────────────────────────────────────────────────────────────────────────────
 def infer_rule_expansions(
     pann_groups: Optional[Dict[str, List[Dict[str, Any]]]],
     features: Dict[str, Any],
     rules: List[Dict[str, Any]],
-    prob_threshold: float = 0.08
+    prob_threshold: float = 0.05
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Apply generic rule expansions to derive labels into target collections (e.g., genre/style).
-    Returns: {"genre": [{"label": ..., "confidence": ...}, ...], "style": [...]}.
+    Expand using simple weighted scoring. Confidence is a clipped 0..1 score proxy.
     """
     present = set()
     if pann_groups:
         for _, items in pann_groups.items():
             for it in items:
-                lbl = it.get("label_raw") or it.get("label")
+                lbl = it.get("label")
                 if not lbl:
                     continue
                 if float(it.get("prob", 0.0)) >= prob_threshold:
@@ -477,11 +484,9 @@ def infer_rule_expansions(
             score += float(weights.get("include_any", 1.0))
         if include_all and all(tag in present for tag in include_all):
             score += float(weights.get("include_all", 1.0))
-
         if boost:
             n_boost = sum(1 for tag in boost if tag in present)
             score += n_boost * float(weights.get("boost", 0.0))
-
         if exclude and any(tag in present for tag in exclude):
             score -= 1.0
 
@@ -506,208 +511,181 @@ def infer_rule_expansions(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Musical features (kept as in your previous version)
+# DeepRhythm integration
 # ──────────────────────────────────────────────────────────────────────────────
-def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
-    features = {}
+def detect_tempo_deeprhythm(audio_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Run DeepRhythm to estimate tempo using DeepRhythmPredictor.
+    DeepRhythm requires longer audio files (at least 5-10 seconds) for reliable tempo detection.
+
+    Returns:
+      {
+        "tempo_bpm": float,
+        "tempo_confidence": float|None,
+        "tempo_method": "deeprhythm",
+        "tempo_debug": { ... }
+      }
+    or None if not available/failed.
+    """
+    if not _DR_OK or DeepRhythmPredictor is None:
+        return None
+        
+    try:
+        # Check audio duration first - DeepRhythm needs longer files
+        try:
+            y, sr = librosa.load(audio_path, sr=None, mono=True)
+            duration = len(y) / sr
+            if duration < 5.0:  # Less than 5 seconds
+                return None
+        except Exception as e:
+            return None
+        
+        # Initialize DeepRhythm predictor (lazy loading)
+        global _DR_MODEL
+        if _DR_MODEL is None:
+            try:
+                _DR_MODEL = DeepRhythmPredictor()
+            except Exception as e:
+                return None
+        
+        # Method 1: Try predict() without confidence first (more reliable)
+        try:
+            tempo = _DR_MODEL.predict(audio_path)
+            return {
+                "tempo_bpm": round(float(tempo), 1),
+                "tempo_confidence": None,
+                "tempo_method": "deeprhythm",
+                "tempo_debug": {"method": "predict_file", "duration": duration}
+            }
+        except Exception as e:
+            pass
+        
+        # Method 2: Try predict() with confidence
+        try:
+            tempo, confidence = _DR_MODEL.predict(audio_path, include_confidence=True)
+            return {
+                "tempo_bpm": round(float(tempo), 1),
+                "tempo_confidence": round(float(confidence), 3) if confidence is not None else None,
+                "tempo_method": "deeprhythm",
+                "tempo_debug": {"method": "predict_file_conf", "duration": duration}
+            }
+        except Exception as e:
+            pass
+        
+        # Method 3: Try predict_from_audio() with librosa-loaded audio
+        try:
+            tempo, confidence = _DR_MODEL.predict_from_audio(y, sr, include_confidence=True)
+            return {
+                "tempo_bpm": round(float(tempo), 1),
+                "tempo_confidence": round(float(confidence), 3) if confidence is not None else None,
+                "tempo_method": "deeprhythm",
+                "tempo_debug": {"method": "predict_from_audio", "duration": duration}
+            }
+        except Exception as e:
+            pass
+            
+    except Exception as e:
+        pass
+
+    return None
+
+
+def _fallback_tempo(y: np.ndarray, sr: int) -> Dict[str, Any]:
+    """
+    Minimal fallback: librosa beat track + simple octave correction heuristics.
+    """
+    try:
+        # base estimate
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=True)
+        bpm = float(tempo)
+        conf = 0.4  # placeholder; librosa doesn't return confidence
+
+        # octave correction heuristics using tempo range priors
+        # map candidate set: {0.5x, 1x, 2x} inside [49, 200] bpm
+        candidates = [bpm / 2.0, bpm, bpm * 2.0]
+        candidates = [c for c in candidates if 49 <= c <= 200]
+
+        # choose closest to common pop/rock priors (75..170), prefer even backbeat region (~120..170)
+        target_ranges = [(75, 170), (100, 140), (120, 170)]
+        weights = [1.0, 1.2, 1.4]
+
+        def score_candidate(c: float) -> float:
+            s = 0.0
+            for (lo, hi), w in zip(target_ranges, weights):
+                if lo <= c <= hi:
+                    s += w
+                else:
+                    # soft distance penalty
+                    dist = min(abs(c - lo), abs(c - hi))
+                    s += max(0.0, w - dist * 0.01)
+            return s
+
+        best = max(candidates, key=score_candidate) if candidates else bpm
+        if abs(best - bpm) > 1.0:
+            bpm = best
+
+        return {
+            "tempo_bpm": round(bpm, 1),
+            "tempo_confidence": conf,
+            "tempo_method": "librosa_fallback",
+            "tempo_debug": {"base": tempo, "candidates": candidates}
+        }
+    except Exception as e:
+        return {
+            "tempo_bpm": 120.0,
+            "tempo_confidence": 0.0,
+            "tempo_method": "librosa_fallback_error",
+            "tempo_debug": {"error": str(e)}
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Musical features (DeepRhythm tempo primary)
+# ──────────────────────────────────────────────────────────────────────────────
+def analyze_audio_features(y: np.ndarray, sr: int, audio_path: Optional[str] = None) -> Dict[str, Any]:
+    """Analyze musical characteristics with DeepRhythm tempo (primary) and librosa fallback."""
+    features: Dict[str, Any] = {}
 
     try:
-        # Tempo
-        tempo_methods = []
-        t1, _ = librosa.beat.beat_track(y=y, sr=sr, units='time')
-        tempo_methods.append(('librosa_default', t1))
-        t2, _ = librosa.beat.beat_track(y=y, sr=sr, units='time', start_bpm=60)
-        tempo_methods.append(('librosa_wide', t2))
-        onset = librosa.onset.onset_detect(y=y, sr=sr, units='time')
-        if len(onset) > 1:
-            iv = np.diff(onset)
-            iv = iv[iv < 2.0]
-            if len(iv) > 0:
-                tempo_methods.append(('onset_based', 60.0 / np.median(iv)))
-
-        valid = [(n, t) for n, t in tempo_methods if 60 <= t <= 200]
-        if valid:
-            pref = [(n, t) for n, t in valid if 80 <= t <= 160]
-            tempo_method, tempo_bpm = (pref[0] if pref else valid[0])
+        # === TEMPO ===
+        if audio_path:
+            dr = detect_tempo_deeprhythm(audio_path)
         else:
-            tempo_method, tempo_bpm = tempo_methods[0]
-        features["tempo_bpm"] = round(float(tempo_bpm), 1)
-        features["tempo_method"] = tempo_method
+            dr = None
 
-        # Key (voting of multiple methods)
-        key_methods: List[tuple] = []
-        try:
-            k1 = librosa.key.estimate_key(y, sr)
-            key_methods.append(('librosa_default', k1))
-        except:
-            pass
-        try:
-            chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
-            cm = np.mean(chroma, axis=1)
-            dom = int(np.argmax(cm))
-            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            key_methods.append(('chroma_dominant', names[dom]))
-        except:
-            pass
-        try:
-            chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
-            cm = np.mean(chroma, axis=1)
-            maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-            mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-            maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
-            min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
-            bi_maj = int(np.argmax(maj_scores))
-            bi_min = int(np.argmax(min_scores))
-            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            key_methods.append((
-                'chroma_weighted',
-                names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] else names[bi_min] + ' minor'
-            ))
-        except:
-            pass
-        try:
-            cqt = librosa.feature.chroma_cqt(y=y, sr=sr, n_chroma=12)
-            cm = np.mean(cqt, axis=1)
-            maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-            mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-            maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
-            min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
-            bi_maj = int(np.argmax(maj_scores))
-            bi_min = int(np.argmax(min_scores))
-            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            key_methods.append((
-                'chroma_cqt',
-                names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] else names[bi_min] + ' minor'
-            ))
-        except:
-            pass
-        try:
-            cens = librosa.feature.chroma_cens(y=y, sr=sr, n_chroma=12)
-            cm = np.mean(cens, axis=1)
-            maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
-            mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-            maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
-            min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
-            bi_maj = int(np.argmax(maj_scores))
-            bi_min = int(np.argmax(min_scores))
-            names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-            key_methods.append((
-                'chroma_cens',
-                names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] else names[bi_min] + ' minor'
-            ))
-        except:
-            pass
-        try:
-            # simple spectral peak heuristic
-            fft = np.fft.fft(y)
-            freqs = np.fft.fftfreq(len(y), 1/sr)
-            pf = freqs[:len(freqs)//2]
-            pa = np.abs(fft[:len(fft)//2])
-            from scipy.signal import find_peaks
-            peaks, _ = find_peaks(pa, height=np.max(pa)*0.1)
-            if len(peaks) > 0:
-                dom = pf[peaks[np.argmax(pa[peaks])]]
-                a4 = 440.0
-                off = 12 * np.log2(max(dom, 1e-12) / a4)
-                idx = int(np.round(off)) % 12
-                names = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#']
-                key_methods.append(('spectral_peaks', names[idx]))
-        except:
-            pass
-
-        if key_methods:
-            key_votes: Dict[str, float] = {}
-            method_w = {
-                'chroma_cqt': 2.5,
-                'chroma_cens': 2.5,
-                'chroma_weighted': 2.0,
-                'librosa_default': 1.5,
-                'spectral_peaks': 1.0,
-                'chroma_dominant': 0.5,
-            }
-            for m, k in key_methods:
-                key_votes[k] = key_votes.get(k, 0.0) + method_w.get(m, 1.0)
-            best_key = max(key_votes, key=key_votes.get)
-            key_method = next((m for m, k in key_methods if k == best_key), 'vote')
-            features["key"] = best_key
-            features["key_method"] = key_method
+        if dr:
+            features["tempo"] = float(dr["tempo_bpm"])
         else:
-            features["key"] = "Unknown"
-            features["key_method"] = "unknown"
+            fb = _fallback_tempo(y, sr)
+            features["tempo"] = fb["tempo_bpm"]
 
-        # Time signature (heuristics)
-        methods_ts = []
+        # === KEY (using Skey from Deezer) ===
         try:
-            frame_length = sr
-            hop_length = frame_length // 4
-            rms_frames = []
-            for i in range(0, len(y) - frame_length, hop_length):
-                frame = y[i:i + frame_length]
-                rms_frames.append(np.sqrt(np.mean(frame**2)))
-            if len(rms_frames) > 8:
-                arr = np.array(rms_frames)
-                arr = (arr - np.mean(arr)) / (np.std(arr) + 1e-12)
-                a44 = sum(1 for i in range(0, len(arr) - 4, 4) if arr[i] > np.mean(arr[i:i+4]) + 0.5)
-                a34 = sum(1 for i in range(0, len(arr) - 3, 3) if arr[i] > np.mean(arr[i:i+3]) + 0.5)
-                methods_ts.append(('accent_analysis', '4/4' if a44 > a34 else '3/4'))
-        except:
-            pass
-        try:
-            onset = librosa.onset.onset_detect(y=y, sr=sr, units='time')
-            if len(onset) > 12:
-                ints = np.diff(onset)
-                avg = np.median(ints)
-                b4 = 0
-                for i in range(0, len(ints) - 3, 4):
-                    if i + 3 < len(ints):
-                        if (ints[i] < avg * 1.5 and ints[i+1] < avg * 1.5 and
-                            ints[i+2] < avg * 1.5 and ints[i+3] > avg * 1.5):
-                            b4 += 1
-                b3 = 0
-                for i in range(0, len(ints) - 2, 3):
-                    if i + 2 < len(ints):
-                        if (ints[i] < avg * 1.5 and ints[i+1] < avg * 1.5 and
-                            ints[i+2] > avg * 1.5):
-                            b3 += 1
-                methods_ts.append(('onset_grouping', '4/4' if b4 > b3 else '3/4'))
-        except:
-            pass
-        try:
-            chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-            cm = np.mean(chroma, axis=0)
-            diff = np.abs(np.diff(cm))
-            p44 = sum(1 for i in range(0, len(diff) - 4, 4) if np.std(diff[i:i+4]) > np.mean(diff))
-            p34 = sum(1 for i in range(0, len(diff) - 3, 3) if np.std(diff[i:i+3]) > np.mean(diff))
-            methods_ts.append(('spectral_periodicity', '4/4' if p44 > p34 else '3/4'))
-        except:
-            pass
-        try:
-            low_centroid = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=2048, hop_length=512)[0]
-            low = low_centroid[low_centroid < 200]
-            if len(low) > 8:
-                peaks4 = sum(1 for i in range(0, len(low) - 4, 4) if np.std(low[i:i+4]) > np.mean(low))
-                methods_ts.append(('kick_drum_analysis', '4/4' if peaks4 > len(low) // 8 else '3/4'))
-        except:
-            pass
-        try:
-            if float(features["tempo_bpm"]) < 60:
-                methods_ts.append(('tempo_heuristic', '3/4'))
+            from skey import detect_key
+            skey_result = detect_key(audio_path, device='cpu')
+            if skey_result and len(skey_result) > 0:
+                features["key"] = skey_result[0]  # skey возвращает список, берем первый элемент
             else:
-                methods_ts.append(('tempo_heuristic', '4/4'))
-        except:
-            pass
+                features["key"] = "Unknown"
+        except Exception as e:
+            # Fallback to simple chroma-based detection if skey fails
+            try:
+                chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_chroma=12)
+                cm = np.mean(chroma, axis=1)
+                maj = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
+                mino = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
+                maj_scores = [np.dot(cm, np.roll(maj, i)) for i in range(12)]
+                min_scores = [np.dot(cm, np.roll(mino, i)) for i in range(12)]
+                bi_maj = int(np.argmax(maj_scores))
+                bi_min = int(np.argmax(min_scores))
+                names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+                features["key"] = (names[bi_maj] + ' major' if maj_scores[bi_maj] > min_scores[bi_min] 
+                                 else names[bi_min] + ' minor')
+            except:
+                features["key"] = "Unknown"
 
-        if methods_ts:
-            v4 = sum(1 for _, s in methods_ts if s == '4/4')
-            v3 = sum(1 for _, s in methods_ts if s == '3/4')
-            ts = '3/4' if v3 > v4 * 1.5 else '4/4'
-            features["time_signature"] = ts
-            features["time_sig_method"] = "majority_vote"
-        else:
-            features["time_signature"] = "4/4"
-            features["time_sig_method"] = "default"
 
-        # Other features
+        # === Other features ===
         rms = librosa.feature.rms(y=y)[0]
         features["energy"] = round(float(np.mean(rms)), 3)
         sc = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
@@ -731,8 +709,8 @@ def analyze_audio_features(y: np.ndarray, sr: int) -> Dict[str, Any]:
 # ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Audio Analysis API",
-    version="2.2.0",
-    description="Audio analysis microservice with PANNs tagging + feature extraction + rules"
+    version="3.1.0",
+    description="Audio analysis microservice with PANNs + DeepRhythm tempo + features + rules"
 )
 
 app.add_middleware(
@@ -751,7 +729,7 @@ async def analyze_track(
     """
     Analyze audio file and return:
       - full PANNs tags grouped by canonical groups (no top-k)
-      - musical features
+      - musical features (tempo by DeepRhythm if available, else fallback)
       - inferred expansions (genre/style) via rules
     """
     if not file.filename.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".m4a")):
@@ -772,14 +750,13 @@ async def analyze_track(
         y, sr = librosa.load(temp_path, sr=None, mono=True)
 
         tags = get_audio_tags(temp_path)
-        features = analyze_audio_features(y, sr)
+        features = analyze_audio_features(y, sr, audio_path=temp_path)
         inferred = infer_rule_expansions(tags, features, CUSTOM_RULES)
 
         duration = float(len(y) / sr)
 
         return JSONResponse({
-            "filename": file.filename,
-            "duration_seconds": duration,
+            "duration": duration,
             "tags": tags,
             "musical_features": features,
             "inferred": inferred,
@@ -801,34 +778,22 @@ async def analyze_track(
 def root():
     return {
         "service": "Audio Tags & Features API",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "endpoints": {
-            "POST /analyze": "Synchronous audio analysis: PANNs tags + musical features + rule expansions",
+            "POST /analyze": "Synchronous audio analysis: PANNs tags + features + rule expansions",
             "GET /tags": "Canonical groups (true PANN/AudioSet labels)",
             "GET /tags/pretty": "Groups with pretty display names",
         },
-        "features": [
-            "Synchronous analysis for immediate results",
-            "PANNs audio tagging with curated musical tags",
-            "Musical feature extraction (tempo, key, time signature)",
-            "Rule-based tag expansion",
-            "External queue integration (configurable)"
-        ],
-        "queue_config_hint": "Set QUEUE_TYPE and connection URLs to enable external queue in the future"
+        "tools": {
+            "panns": _PANN_OK,
+            "deeprhythm": _DR_OK,
+            "deeprhythm_version": _DR_VERSION,
+        }
     }
 
 
 @app.get("/tags")
 def get_canonical_tag_groups():
-    return {
-        "total_tags": sum(len(tags) for tags in BW_TAG_GROUPS.values()),
-        "categories": {key: len(tags) for key, tags in BW_TAG_GROUPS.items()},
-        "tags": BW_TAG_GROUPS
-    }
-
-
-@app.get("/tags/pretty")
-def get_pretty_tag_groups():
     pretty: Dict[str, List[str]] = {}
     for g, tags in BW_TAG_GROUPS.items():
         pretty[g] = [prettify_label(lbl, group_name=g) for lbl in tags]
@@ -837,5 +802,3 @@ def get_pretty_tag_groups():
         "categories": {key: len(tags) for key, tags in pretty.items()},
         "tags": pretty
     }
-
-
