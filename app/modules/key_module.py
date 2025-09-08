@@ -17,6 +17,7 @@ class KeyModule(BaseAnalysisModule):
     def analyze(self, 
                 audio_data: np.ndarray, 
                 sample_rate: int, 
-                audio_path: Optional[str] = None) -> Dict[str, Any]:
+                audio_path: Optional[str] = None,
+                **kwargs) -> Dict[str, Any]:
         """Key analysis"""
         return self.service.analyze_key(audio_data, sample_rate, audio_path)

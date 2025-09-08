@@ -25,7 +25,8 @@ class ModuleRegistry:
                            audio_data: np.ndarray, 
                            sample_rate: int, 
                            audio_path: Optional[str],
-                           requested_modules: List[AnalysisModule]) -> Dict[str, any]:
+                           requested_modules: List[AnalysisModule],
+                           module_kwargs: Optional[Dict[str, Dict]] = None) -> Dict[str, any]:
         """Analysis with specified modules"""
         results = {}
         
@@ -33,7 +34,13 @@ class ModuleRegistry:
             module = self.get_module(module_name)
             if module and module.can_analyze(audio_data, sample_rate):
                 try:
-                    results[module_name.value] = module.analyze(audio_data, sample_rate, audio_path)
+                    # Get module-specific kwargs
+                    kwargs = module_kwargs.get(module_name.value, {}) if module_kwargs else {}
+                    
+                    # Call analyze with kwargs
+                    results[module_name.value] = module.analyze(
+                        audio_data, sample_rate, audio_path, **kwargs
+                    )
                 except Exception as e:
                     print(f"Error in module {module_name}: {e}")
                     results[module_name.value] = None

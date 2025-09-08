@@ -120,12 +120,16 @@ async def get_canonical_tag_groups(desc: bool = Query(False, description="Includ
 @app.post("/analyze")
 async def analyze_audio(
     file: UploadFile = File(...),
-    modules: str = "tags,tempo,key,features"
+    modules: str = "tags,tempo,key,features",
+    normalize: bool = Query(True, description="Apply normalization to tag probabilities"),
+    temperature: float = Query(1.2, description="Temperature for softmax normalization")
 ):
     """
     Audio analysis with module selection
     
     modules: comma-separated list of modules (tags,tempo,key,features)
+    normalize: apply probability normalization to tags
+    temperature: temperature parameter for softmax (higher = more uniform)
     """
     t0 = time.time()
     
@@ -164,9 +168,20 @@ async def analyze_audio(
         # Load audio
         y, sr = librosa.load(temp_path, sr=None, mono=True)
         
+        # Prepare module-specific parameters
+        module_kwargs = {}
+        if AnalysisModule.TAGS in requested_modules:
+            normalization_opts = {
+                'temperature': temperature
+            }
+            module_kwargs['tags'] = {
+                'normalize': normalize,
+                'normalization_opts': normalization_opts
+            }
+        
         # Analysis with selected modules
         results = module_registry.analyze_with_modules(
-            y, sr, temp_path, requested_modules
+            y, sr, temp_path, requested_modules, module_kwargs
         )
         
         # Form response in new format
@@ -183,13 +198,17 @@ async def analyze_audio(
         if AnalysisModule.TAGS in requested_modules:
             response_data["tags"] = results.get('tags')
             
-        # Process features module - move energy and brightness to top level
+        # Process features module - move energy/brightness to top level
         if AnalysisModule.FEATURES in requested_modules:
             features = results.get('features', {})
             if 'energy' in features:
                 response_data["energy"] = features['energy']
+            if 'energy_value' in features:
+                response_data["energy_value"] = features['energy_value']
             if 'brightness' in features:
                 response_data["brightness"] = features['brightness']
+            if 'brightness_value' in features:
+                response_data["brightness_value"] = features['brightness_value']
         
         
         return JSONResponse(response_data)

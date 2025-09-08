@@ -35,15 +35,15 @@ BW_TAG_GROUPS = {
         "Applause", "Cheering", "Crowd", "Chatter"
     ],
     "mood": [
-        "Happy", "Sad", "Tender", "Funny",
-        "Exciting", "Angry", "Scary"
+        "Happy music", "Sad music", "Tender music", 
+        "Funny music", "Exciting music", "Scary music"
     ],
     "effects": [
         "Echo", "Reverberation", "Distortion", "Chorus effect"
     ],
     "style": [
-        "Jingle", "Theme", "Background", 
-        "Wedding", "Christmas"
+        "Jingle", "Theme music", "Background music", 
+        "Wedding music", "Christmas music"
     ]
 }
 

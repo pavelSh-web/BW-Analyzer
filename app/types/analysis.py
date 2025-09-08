@@ -8,6 +8,11 @@ class AnalysisModule(str, Enum):
     KEY = "key"
     FEATURES = "features"
 
+class NormalizedTag(BaseModel):
+    """Normalized tag; prob is softmax-normalized within group (sums to 1)"""
+    label: str
+    prob: float
+
 class AnalysisRequest(BaseModel):
     modules: List[AnalysisModule] = [
         AnalysisModule.TAGS,

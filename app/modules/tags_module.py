@@ -18,11 +18,18 @@ class TagsModule(BaseAnalysisModule):
     def analyze(self, 
                 audio_data: np.ndarray, 
                 sample_rate: int, 
-                audio_path: Optional[str] = None) -> Dict[str, Any]:
+                audio_path: Optional[str] = None,
+                normalize: bool = True,
+                normalization_opts: Optional[Dict[str, Any]] = None,
+                **kwargs) -> Dict[str, Any]:
         """Tags analysis using PANNs"""
         if not audio_path:
             return None
         
         # Create fresh service for each request to avoid caching issues
         service = PANNsService()
-        return service.get_audio_tags(audio_path)
+        return service.get_audio_tags(
+            audio_path, 
+            normalize=normalize, 
+            normalization_opts=normalization_opts
+        )

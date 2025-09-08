@@ -1336,31 +1336,31 @@
     "description": "Portmanteau class for music categories that indicate the over emotional affect of music, regardless of genre or instrumentation. These judgments are intrinsically subjective and likely to vary substantially between different musical cultures."
   },
   {
-    "name": "Happy",
+    "name": "Happy music",
     "description": "Music that evokes or conveys feelings of happiness."
   },
   {
-    "name": "Funny",
+    "name": "Funny music",
     "description": "Music that evokes or conveys amusement."
   },
   {
-    "name": "Sad",
+    "name": "Sad music",
     "description": "Music that evokes or conveys feelings of sadness."
   },
   {
-    "name": "Tender",
+    "name": "Tender music",
     "description": "Music that evokes or conveys feelings of tenderness."
   },
   {
-    "name": "Exciting",
+    "name": "Exciting music",
     "description": "Music that evokes or conveys feelings of excitement."
   },
   {
-    "name": "Angry",
+    "name": "Angry music",
     "description": "Music that evokes or conveys feelings of anger."
   },
   {
-    "name": "Scary",
+    "name": "Scary music",
     "description": "Music that evokes or conveys feelings of fear."
   },
   {

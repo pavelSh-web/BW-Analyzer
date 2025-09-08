@@ -4,6 +4,7 @@ import os
 import numpy as np
 from typing import Dict, List, Any, Optional
 from ..config import BW_TAG_GROUPS, DISPLAY_ALIASES
+from .tag_normalization_service import TagNormalizationService
 
 class PANNsService:
     """Service for audio tag analysis using PANNs"""
@@ -11,6 +12,7 @@ class PANNsService:
     def __init__(self):
         self._model = None
         self._device = None
+        self._normalization_service = TagNormalizationService()
         self._load_model()
     
     def _load_model(self):
@@ -79,7 +81,7 @@ class PANNsService:
             return label_raw.split(",", 1)[0].strip()
         return label_raw
     
-    def get_audio_tags(self, audio_path: str) -> Optional[Dict[str, Any]]:
+    def get_audio_tags(self, audio_path: str, normalize: bool = True, normalization_opts: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Get tags for audio file"""
         if not self._model:
             print("PANNs model not loaded")
@@ -131,6 +133,10 @@ class PANNsService:
                 out[gname] = list(seen_labels.values())
                 # Sort by probability again after deduplication
                 out[gname].sort(key=lambda x: x["prob"], reverse=True)
+            
+            # Apply normalization if requested
+            if normalize:
+                out = self._normalization_service.normalize_tags_dict(out, normalization_opts)
             
             return out
             
