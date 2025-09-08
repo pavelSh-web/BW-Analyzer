@@ -20,6 +20,19 @@ docker build -t audio-analyzer .
 docker run -p 8000:8000 audio-analyzer
 ```
 
+### Docker Compose (start.sh)
+
+```bash
+chmod +x start.sh stop.sh
+./start.sh
+# stop:
+./stop.sh
+```
+
+Notes:
+- Both options launch the same API. The compose/start.sh path uses docker-compose to build and run, and mounts `./app` into the container for convenient local edits.
+- Use `start.sh` for day-to-day development; use `docker build/run` for a quick one-off run without compose.
+
 ### Local run
 
 ```bash

@@ -42,7 +42,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 # Environment variables
-ENV REDIS_URL=redis://redis:6379/0
 ENV PYTHONPATH=/app
 
 # Expose API port
