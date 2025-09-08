@@ -41,9 +41,9 @@ def prettify_label(label_raw: str, group_name: Optional[str] = None) -> str:
 
 # FastAPI initialization
 app = FastAPI(
-    title="BW Analyzer 3.0 - Modular",
-    description="Modular audio analysis API with selective processing",
-    version="3.0.0"
+    title="BW Analyzer",
+    description="Music analysis service. Estimates genre probabilities and additional musical characteristics from an audio file, and also detects tempo (BPM), musical key, energy, and brightness of the track.",
+    version="1.0.0"
 )
 
 # CORS
