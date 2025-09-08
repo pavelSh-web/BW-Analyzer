@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# Скрипт остановки Audio Analysis микросервиса
+# Script to stop Audio Analysis microservice
 
 echo "🛑 Stopping Audio Analysis Microservice..."
 
-# Останавливаем и удаляем контейнеры
+# Stop and remove containers
 docker-compose down
 
-# Опционально: удаляем volumes (раскомментируйте если нужно)
+# Optional: remove volumes
 # echo "🗑️  Removing volumes..."
 # docker-compose down -v
 
 echo "✅ Audio Analysis Microservice stopped!"
 
-# Показываем статус
+# Show container status
 echo "📊 Container status:"
 docker-compose ps

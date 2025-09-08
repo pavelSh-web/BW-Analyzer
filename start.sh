@@ -1,24 +1,24 @@
 #!/bin/bash
 
-# Скрипт запуска Audio Analysis микросервиса
+# Script to start Audio Analysis microservice
 
 echo "🎵 Starting Audio Analysis Microservice..."
 
-# Проверяем наличие docker-compose
+# Checking docker-compose
 if ! command -v docker-compose &> /dev/null; then
     echo "❌ docker-compose not found. Please install Docker Compose."
     exit 1
 fi
 
-# Останавливаем если что-то уже запущено
+# Stopping any existing containers
 echo "🛑 Stopping any existing containers..."
 docker-compose down
 
-# Собираем образы
+# Building containers
 echo "🔨 Building containers..."
 docker-compose build
 
-# Запускаем сервисы
+# Starting services
 echo "🚀 Starting services..."
 docker-compose up -d
 
@@ -26,11 +26,11 @@ docker-compose up -d
 echo "⏳ Waiting for services to start..."
 sleep 10
 
-# Проверяем статус
+# Checking service status
 echo "🔍 Checking service status..."
 docker-compose ps
 
-# Проверяем здоровье API
+# Checking API health
 echo "🏥 Checking API health..."
 if curl -f http://localhost:8000/ > /dev/null 2>&1; then
     echo "✅ API is healthy and running on http://localhost:8000"
@@ -38,7 +38,7 @@ else
     echo "❌ API health check failed"
 fi
 
-# Проверяем Redis
+# Checking Redis
 echo "🔍 Checking Redis..."
 if docker-compose exec -T redis redis-cli ping > /dev/null 2>&1; then
     echo "✅ Redis is running"
