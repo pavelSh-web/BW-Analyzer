@@ -1,7 +1,5 @@
 ![Cover image](https://github.com/pavelSh-web/BW-Analyzer/blob/b05536cff4088157cf0e4e11a94ff82a6a7a806d/cover.png)
 
-# BW-Analyzer
-
 Music analysis service. Estimates genre probabilities and additional musical characteristics from an audio file, and also detects tempo (BPM), musical key, energy, and brightness of the track.
 
 ## Features
