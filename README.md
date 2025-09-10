@@ -1,4 +1,4 @@
-![Cover](https://github.com/pavelSh-web/BW-Analyzer/blob/bc89ecd341d2240d51b5ec61548e5bd99fb32c09/cover.jpg)
+![Cover](https://github.com/pavelSh-web/BW-Analyzer/blob/b145019ccf9aaacba1d710570a7173262e57eb1a/cover.png)
 
 # BW-Analyzer
 
