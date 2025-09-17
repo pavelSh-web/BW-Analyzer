@@ -15,7 +15,8 @@ from .modules import (
     TagsModule, TempoModule, KeyModule, FeaturesModule
 )
 from .types.analysis import AnalysisRequest, AnalysisResponse, AnalysisModule
-from .config import BW_TAG_GROUPS, DISPLAY_ALIASES
+from .config import BW_TAG_GROUPS, DISPLAY_ALIASES, SOFTMAX_TEMPERATURE
+from .services.embedding_service import EmbeddingService
 
 # Load tags descriptions
 def load_tags_descriptions():
@@ -63,6 +64,9 @@ module_registry.register(TagsModule())
 module_registry.register(TempoModule())
 module_registry.register(KeyModule())
 module_registry.register(FeaturesModule())
+
+# Embedding service
+embedding_service = EmbeddingService()
 
 @app.get("/")
 async def root():
@@ -120,30 +124,17 @@ async def get_canonical_tag_groups(desc: bool = Query(False, description="Includ
 @app.post("/analyze")
 async def analyze_audio(
     file: UploadFile = File(...),
-    modules: str = "tags,tempo,key,features",
-    normalize: bool = Query(True, description="Apply normalization to tag probabilities"),
-    temperature: float = Query(1.2, description="Temperature for softmax normalization")
 ):
     """
     Audio analysis with module selection
     
     modules: comma-separated list of modules (tags,tempo,key,features)
     normalize: apply probability normalization to tags
-    temperature: temperature parameter for softmax (higher = more uniform)
     """
     t0 = time.time()
     
-    # Parse requested modules
-    try:
-        requested_modules = []
-        for module_str in modules.split(','):
-            module_str = module_str.strip()
-            if module_str in [m.value for m in AnalysisModule]:
-                requested_modules.append(AnalysisModule(module_str))
-            else:
-                raise ValueError(f"Unknown module: {module_str}")
-    except ValueError as e:
-        raise HTTPException(400, f"Invalid modules parameter: {e}")
+    # Always run full analysis across all available modules
+    requested_modules = module_registry.get_available_modules()
     
     # File type validation
     if not file.filename:
@@ -172,10 +163,10 @@ async def analyze_audio(
         module_kwargs = {}
         if AnalysisModule.TAGS in requested_modules:
             normalization_opts = {
-                'temperature': temperature
+                'temperature': SOFTMAX_TEMPERATURE
             }
             module_kwargs['tags'] = {
-                'normalize': normalize,
+                'normalize': True,
                 'normalization_opts': normalization_opts
             }
         
@@ -194,13 +185,21 @@ async def analyze_audio(
         if AnalysisModule.KEY in requested_modules and results.get('key'):
             response_data["key"] = results['key']['key']
         
-        # Add other modules as is
+        # Add tags with client formatting (convert tag->label, remove tag field)
         if AnalysisModule.TAGS in requested_modules:
-            response_data["tags"] = results.get('tags')
+            internal_tags = results.get('tags')
+            if internal_tags:
+                from .services.tag_normalization_service import TagNormalizationService
+                tag_service = TagNormalizationService()
+                response_data["tags"] = tag_service.prepare_for_client(internal_tags)
+            else:
+                response_data["tags"] = {}
             
         # Process features module - move energy/brightness to top level
         if AnalysisModule.FEATURES in requested_modules:
             features = results.get('features', {})
+            
+            # Move energy/brightness to top level for backward compatibility
             if 'energy' in features:
                 response_data["energy"] = features['energy']
             if 'energy_value' in features:
@@ -209,6 +208,9 @@ async def analyze_audio(
                 response_data["brightness"] = features['brightness']
             if 'brightness_value' in features:
                 response_data["brightness_value"] = features['brightness_value']
+            
+            # Add features as is
+            response_data["features"] = features
         
         
         return JSONResponse(response_data)
@@ -216,6 +218,91 @@ async def analyze_audio(
     except Exception as e:
         raise HTTPException(500, f"Analysis failed: {str(e)}")
     
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+
+@app.post("/embedding")
+async def embedding_audio(
+    file: UploadFile = File(...),
+):
+    """
+    Audio analysis with embedding vector generation.
+    Returns only { embedding, dim } - the embedding vector and its dimension.
+    """
+    # Reuse /analyze logic by invoking the same flow
+    t0 = time.time()
+
+    # Always run full analysis across all available modules
+    requested_modules = module_registry.get_available_modules()
+
+    if not file.filename:
+        raise HTTPException(400, "No filename provided")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ['.wav', '.mp3', '.flac', '.m4a', '.ogg']:
+        raise HTTPException(400, "Unsupported file type")
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            temp_path = tmp.name
+
+        y, sr = librosa.load(temp_path, sr=None, mono=True)
+
+        module_kwargs = {}
+        if AnalysisModule.TAGS in requested_modules:
+            normalization_opts = {
+                'temperature': SOFTMAX_TEMPERATURE
+            }
+            module_kwargs['tags'] = {
+                'normalize': True,
+                'normalization_opts': normalization_opts
+            }
+
+        results = module_registry.analyze_with_modules(
+            y, sr, temp_path, requested_modules, module_kwargs
+        )
+
+        response_data: Dict[str, Any] = {}
+        if AnalysisModule.TEMPO in requested_modules and results.get('tempo'):
+            response_data["tempo"] = results['tempo']['tempo']
+        if AnalysisModule.KEY in requested_modules and results.get('key'):
+            response_data["key"] = results['key']['key']
+        if AnalysisModule.TAGS in requested_modules:
+            response_data["tags"] = results.get('tags')  # Keep internal format for embedding
+        
+        # Process features module - move energy/brightness to top level
+        if AnalysisModule.FEATURES in requested_modules:
+            features = results.get('features', {})
+            
+            # Move energy/brightness to top level for backward compatibility
+            if 'energy' in features:
+                response_data["energy"] = features['energy']
+            if 'energy_value' in features:
+                response_data["energy_value"] = features['energy_value']
+            if 'brightness' in features:
+                response_data["brightness"] = features['brightness']
+            if 'brightness_value' in features:
+                response_data["brightness_value"] = features['brightness_value']
+            
+            # Add features as is
+            response_data["features"] = features
+
+        # Build embedding (fixed order, zero-fill for missing data)
+        emb = embedding_service.build(response_data)
+        
+        # Return only embedding data
+        return JSONResponse(emb)
+
+    except Exception as e:
+        raise HTTPException(500, f"Embedding failed: {str(e)}")
     finally:
         if temp_path and os.path.exists(temp_path):
             try:

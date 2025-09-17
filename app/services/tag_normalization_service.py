@@ -29,11 +29,11 @@ class TagNormalizationService:
         Normalize probabilities within a group
         
         Args:
-            items: List of tags with 'label' and 'prob' keys
+            items: List of tags with 'label' and 'prob' keys (optionally 'tag' for raw PANNs label)
             opts: Normalization options
         
         Returns:
-            List of normalized tags with 'label', 'raw', 'mix', 'score' keys
+            List of normalized tags preserving 'tag' (raw), with 'label' and 'prob'
         """
         if not items:
             return []
@@ -48,23 +48,23 @@ class TagNormalizationService:
         
         temperature = default_opts['temperature']
         
-        # 1) Сортировка по вероятности + floor (без отсечения по topK)
+        # 1) Sort by probability + floor (no topK cut)
         sorted_items = sorted(items, key=lambda x: x.get('prob', 0), reverse=True)
         ps = [max(item.get('prob', 0), self.EPS) for item in sorted_items]
         
         if not ps:
             return []
         
-        # 2) Лог-шкала → softmax с температурой (микс внутри группы)
+        # 2) Log-scale → softmax with temperature (mix inside group)
         xs = [math.log(p + self.EPS) for p in ps]
         q = self._softmax(xs, temperature)
         
-        # Формируем результат: используем mix как prob
+        # 3) Build result: keep only 'tag' (raw) and 'prob' for internal processing
         result = []
         for i, item in enumerate(sorted_items):
             result.append({
-                'label': item.get('label', ''),
-                'prob': q[i]      # распределение внутри группы (сумма=1)
+                'tag': item.get('tag', ''),
+                'prob': q[i]
             })
         
         return result
@@ -88,5 +88,39 @@ class TagNormalizationService:
                 result[group_name] = self.normalize_group(items, opts)
             else:
                 result[group_name] = []
+        
+        return result
+    
+    def prepare_for_client(self, tags_dict: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Prepare normalized tags for client output: convert 'tag' to 'label' and remove 'tag'
+        
+        Args:
+            tags_dict: Internal tags with 'tag' and 'prob' fields
+            
+        Returns:
+            Client-ready tags with 'label' and 'prob' fields
+        """
+        from ..services.panns_service import PANNsService
+        
+        # Create PANNsService instance for prettification
+        panns_service = PANNsService()
+        
+        result = {}
+        for group_name, items in tags_dict.items():
+            client_items = []
+            for item in items:
+                raw_tag = item.get('tag', '')
+                prob = item.get('prob', 0.0)
+                
+                # Convert raw tag to pretty label
+                pretty_label = panns_service.prettify_label(raw_tag, group_name)
+                
+                client_items.append({
+                    'label': pretty_label,
+                    'prob': prob
+                })
+            
+            result[group_name] = client_items
         
         return result

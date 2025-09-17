@@ -49,7 +49,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `GET /` — service info
 - `GET /modules` — list of available modules
 - `GET /tags?desc=false` — tag groups (with descriptions when `desc=true`)
-- `POST /analyze` — analyze an audio file
+- `POST /analyze` — analyze an audio file (full pipeline, normalized tags)
+- `POST /embedding` — analyze + return embedding vector
 
 ### Tag groups
 - `genre`
@@ -132,13 +133,11 @@ With descriptions (`?desc=true`):
 ```bash
 curl -X POST "http://localhost:8000/analyze" \
   -F "file=@audio.mp3" \
-  -F "modules=tags,tempo,key,features"
+  
 ```
 
 Query parameters for `POST /analyze`:
-- `modules`: `tags,tempo,key,features` (comma-separated)
-- `normalize` (bool, default true): enable tag normalization
-- `temperature` (float, default 1.2): softmax temperature within a group
+- `temperature` (float, default 1.2): softmax temperature within a group (for tag normalization).
 
 ### Response format (main fields)
 
@@ -162,22 +161,66 @@ Query parameters for `POST /analyze`:
 }
 ```
 
+### Example: embedding
+```bash
+curl -X POST "http://localhost:8000/embedding" \
+  -F "file=@audio.mp3"
+```
+
+Response (embedding only):
+```json
+{
+  "embedding": [0.02, 0.15, 0.01, ...],
+  "dim": 163
+}
+```
+
+Embedding details:
+- **Block-wise L2 normalized** with semantic weights for balanced representation
+- **Structure**: Tags[109] + Tempo[1] + Energy/Brightness[2] + Rhythm[3] + Harmony[37] + Timbre[6] + Dynamics[5] = 163
+- **L2 normalized**: Global L2 norm = 1.0 for consistent cosine similarity
+- **Deterministic**: Same audio always produces identical embedding
+- **Block weights**: tags (1.0), tempo (0.5), energy/brightness (0.7), rhythm (0.6), harmony (0.8), timbre (0.7), dynamics (0.6)
+
 ### Tag normalization
 - Within each group, apply log‑scale + softmax with temperature; return `prob` (sum within a group = 1).
 - `temperature` controls distribution sharpness: lower = sharper, higher = more uniform.
 
 ## Feature notes
 - **energy_value**: mean RMS (>= 0)
-  - **energy thresholds**: `< 0.10` → low, `0.10–0.22` → mid, `> 0.22` → high
+  - **energy thresholds**: `< 0.10` → low, `0.10–0.22` → mid, `> 0.22` → high (configurable in `ENERGY_THRESHOLDS`)
 - **brightness_value**: 75th percentile spectral centroid over active frames (Hz)
   - Normalization: `centroid / (sr / 2)`
-  - **brightness thresholds**: `< 0.20` → low, `0.20–0.50` → mid, `> 0.50` → high
+  - **brightness thresholds**: `< 0.20` → low, `0.20–0.50` → mid, `> 0.50` → high (configurable in `BRIGHTNESS_THRESHOLDS`)
 
 ## Modules
 - **tags**: PANNs-based audio tags grouped into `genre`, `instruments`, `vocal`, `atmosphere`, `mood`, `effects`, `style`. Supports normalization (`normalize`, `temperature`).
 - **tempo**: BPM estimation (DeepRhythm + librosa) with minimum-duration validation.
 - **key**: Musical key detection (major/minor) using Skey + librosa.
-- **features**: Basic features — `energy`, `energy_value`, `brightness`, `brightness_value`.
+- **features**: Comprehensive analysis with energy, brightness, rhythm, harmony, timbre, and dynamics features.
+
+### Features Details
+
+**Rhythm**:
+- `onset_density`: Events per second (distinguishes danceable vs calm tracks)
+- `percussive_harmonic_ratio`: Balance of percussive vs harmonic content (via HPSS)
+- `beat_histogram_mean/std`: Rhythm structure statistics
+
+**Harmony**:
+- `chroma_mean/std`: 12-dimensional note distribution (harmonic "color")
+- `tonnetz_mean/std`: 6-dimensional harmonic network features (chord relationships)
+- `key_clarity`: How clearly the musical key is expressed
+
+**Timbre/Spectral**:
+- `spectral_flatness_mean/std`: Noisiness vs tonality measure
+- `spectral_bandwidth_mean/std`: Frequency spread (narrow vocal vs wide electronic)
+- `zero_crossing_rate_mean/std`: Indicator of noisy/percussive sounds
+
+**Dynamics**:
+- `dynamic_range_db`: Contrast between loud and quiet parts
+- `loudness_mean/std/min/max`: RMS energy statistics
+- `loudness_range`: Difference between 95th and 5th percentile
+- `lufs`: Integrated loudness (if pyloudnorm available)
 
 ## Architecture (short)
 ```

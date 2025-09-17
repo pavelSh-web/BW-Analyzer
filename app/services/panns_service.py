@@ -126,7 +126,8 @@ class PANNsService:
                     pretty_label = self.prettify_label(lbl, group_name=gname)
                     if pretty_label not in seen_labels or prob > seen_labels[pretty_label]["prob"]:
                         seen_labels[pretty_label] = {
-                            "label": pretty_label,
+                            "tag": lbl,  # Original tag from PANNs
+                            "label": pretty_label,  # Normalized label for display
                             "prob": round(float(prob), 10)
                         }
                 

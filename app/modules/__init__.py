@@ -5,7 +5,7 @@ from .features_module import FeaturesModule
 
 __all__ = [
     "TagsModule",
-    "TempoModule",
+    "TempoModule", 
     "KeyModule",
     "FeaturesModule"
 ]
